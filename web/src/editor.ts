@@ -1,9 +1,16 @@
 import { autocompletion, type CompletionContext } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import { sql, MySQL } from "@codemirror/lang-sql";
-import { EditorState } from "@codemirror/state";
+import { sql, MySQL, PostgreSQL } from "@codemirror/lang-sql";
+import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { oneDark } from "@codemirror/theme-one-dark";
+import type { DatabaseEngine } from "./types";
+
+const dialect = new Compartment();
+
+function sqlExtension(engine: DatabaseEngine) {
+  return sql({ dialect: engine === "postgres" ? PostgreSQL : MySQL });
+}
 
 export function createEditor(
   parent: HTMLElement,
@@ -25,7 +32,7 @@ export function createEditor(
       doc: "SELECT *\nFROM ",
       extensions: [
         history(),
-        sql({ dialect: MySQL }),
+        dialect.of(sqlExtension("mysql")),
         autocompletion({ override: [completions] }),
         keymap.of([
           ...defaultKeymap,
@@ -37,6 +44,10 @@ export function createEditor(
       ],
     }),
   });
+}
+
+export function setEditorEngine(view: EditorView, engine: DatabaseEngine): void {
+  view.dispatch({ effects: dialect.reconfigure(sqlExtension(engine)) });
 }
 
 export function selectedQuery(view: EditorView): string {

@@ -1,6 +1,8 @@
 export type TLSMode = "disabled" | "system" | "custom" | "mutual";
+export type DatabaseEngine = "mysql" | "postgres";
 
 export interface ConnectionInput {
+  engine: DatabaseEngine;
   host: string;
   port: number;
   user: string;
@@ -17,6 +19,7 @@ export interface ConnectionInput {
 
 export interface Connection {
   id: string;
+  engine?: DatabaseEngine;
   serverVersion: string;
   database: string;
 }
@@ -24,6 +27,8 @@ export interface Connection {
 export interface ConnectionProfile {
   id: string;
   name: string;
+  // Optional so profiles written before PostgreSQL support still load as MySQL.
+  engine?: DatabaseEngine;
   host: string;
   port: number;
   user: string;
@@ -40,6 +45,7 @@ export interface ConnectionProfile {
 export interface QueryHistoryEntry {
   id: string;
   sql: string;
+  engine?: DatabaseEngine;
   database: string;
   server: string;
   executedAt: string;
@@ -69,7 +75,7 @@ export interface BrowseResult {
 }
 
 export interface DatabaseItem { name: string }
-export interface TableItem { name: string; type: "table" | "view" }
+export interface TableItem { name: string; type: "table" | "view" | "foreign table" }
 export interface ColumnItem { name: string; dataType: string; nullable: boolean; key?: string }
 
 export interface ResultColumn {

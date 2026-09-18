@@ -1,12 +1,12 @@
-# Lightweight MySQL/MariaDB browser client
+# Lightweight PostgreSQL/MySQL/MariaDB browser client
 
-Status: implementation plan; no application code exists yet.
+Status: active implementation; the Phase 1–3 workflow is runnable and PostgreSQL/MySQL/MariaDB support is implemented.
 
 ## Agreed direction
 
-Build a free, focused SQL client, initially distributed for macOS. A CLI command starts a local Go process and opens the existing browser. MySQL and MariaDB are the first database targets. Connections go directly to the database and support TLS. The initial workflow is connect → browse schema → run a query → inspect/copy/export results, with read-only connections by default.
+Build a free, focused SQL client, initially distributed for macOS. A CLI command starts a local Go process and opens the existing browser. PostgreSQL, MySQL, and MariaDB are the first database targets. Connections go directly to the database and support TLS. The initial workflow is connect → browse schema → run a query → inspect/copy/export results, with read-only connections by default.
 
-Backend resident memory is the primary memory metric, as requested. Browser memory is excluded from that budget. Browser responsiveness still matters. The backend will stay running while the CLI runs; Ctrl-C closes database sessions and shuts it down. Working name: `db0`, pending a naming decision.
+Backend resident memory is the primary memory metric, as requested. Browser memory is excluded from that budget. Browser responsiveness still matters. The backend will stay running while the CLI runs; Ctrl-C closes database sessions and shuts it down. Product name: Rowlight.
 
 ## Options and recommendation
 
@@ -39,15 +39,15 @@ Proposed v0.1 boundary: no write-mode toggle, grid editing, schema migrations, S
 ```text
 Browser: connection form | schema tree | SQL editor | results grid
                  authenticated local HTTP / streamed results
-Go: local server → query coordinator → database/sql + MySQL driver
+Go: local server → query coordinator → database/sql + MySQL/PostgreSQL drivers
           ├─ connection profiles / credential store
           ├─ bounded schema cache
           └─ cancellation, result encoding and resource limits
                                       ↓ direct TCP / TLS
-                              MySQL or MariaDB
+                       PostgreSQL, MySQL, or MariaDB
 ```
 
-The browser never connects directly to MySQL. The backend owns credentials and database sessions. Use a small lazy connection pool per connected profile, a global cap, one active query per editor, and a separate control path for cancellation. Unused profiles must not open sockets. Metadata discovery must not scan entire tables or automatically run expensive exact row counts.
+The browser never connects directly to the database. The backend owns credentials and database sessions. Use a small lazy connection pool per connected profile, a global cap, one active query per editor, and a separate control path for cancellation. Unused profiles must not open sockets. Metadata discovery must not scan entire tables or automatically run expensive exact row counts.
 
 Each query gets an ID, context deadline, and pinned database connection/transaction. The stream contains metadata, bounded row batches, and one terminal event: complete, truncated, cancelled, or failed. Close rows, roll back the read transaction, and release or discard the connection on every path. Clean up on browser disconnect as well as explicit cancellation. Persistent user-controlled SQL sessions are outside v0.1. Do not keep completed results in a backend cache.
 
@@ -59,9 +59,9 @@ Preserve BIGINT and DECIMAL as exact strings with type metadata. Keep SQL NULL d
 
 ## Read-only behavior and local access
 
-Read-only transactions are a useful layer, not a complete sandbox for arbitrary SQL. MySQL permits some temporary-table changes; implicit commits and session-control statements require care across both database families. A restricted database account is the authoritative protection against unauthorized writes. [MySQL transaction behavior](https://dev.mysql.com/doc/refman/8.4/en/commit.html), [MariaDB transactions](https://mariadb.com/docs/server/reference/sql-statements/transactions/start-transaction).
+Read-only transactions are a useful layer, not a complete sandbox for arbitrary SQL. MySQL permits some temporary-table changes; implicit commits and session-control statements require care across all supported engines. A restricted database account is the authoritative protection against unauthorized writes. [MySQL transaction behavior](https://dev.mysql.com/doc/refman/8.4/en/commit.html), [MariaDB transactions](https://mariadb.com/docs/server/reference/sql-statements/transactions/start-transaction).
 
-The initial policy will accept one understood read statement at a time and use a read-only transaction on the same pinned connection. Keep driver multi-statements disabled. A dialect-aware parser/policy must reject unknown statements, transaction/session control, locking reads, file output, procedure calls, and executable-comment bypasses. A first-keyword check is insufficient; even SELECT can have side effects through functions. Select the parser only after a MySQL/MariaDB compatibility and footprint spike. Unsupported safety setup fails closed, with an actionable explanation. Do not promise that parsing makes a privileged account safe for arbitrary hostile SQL.
+The initial policy accepts one understood read statement at a time and uses a read-only transaction on the same pinned connection. MySQL driver multi-statements remain disabled. The policy applies PostgreSQL- or MySQL-specific quoting and comment rules and rejects unknown statements, transaction/session control, locking reads, file output, procedure calls, and executable-comment bypasses. A first-keyword check is insufficient; even SELECT can have side effects through functions. Unsupported safety setup fails closed, with an actionable explanation. Do not promise that parsing makes a privileged account safe for arbitrary hostile SQL.
 
 Bind the HTTP server to loopback only. Require a random per-launch credential, validate Host and Origin, protect state-changing requests, and disable permissive CORS. Design and test the browser bootstrap so credentials are not placed in query strings or request logs. Escape database content as text, use a restrictive content security policy, and load all runtime assets locally.
 
@@ -89,12 +89,12 @@ Use release builds and report median and p95 startup timings plus peak RSS. Meas
 | Milestone | Deliverable | Completion check |
 |---|---|---|
 | 1. Feasibility | Tiny Go server, embedded editor/grid experiment, direct TLS connection, parser/read-only and cancellation experiments | Measured baseline; verified server cancellation behavior; explicit supported SQL subset; chosen frontend and parser |
-| 2. First usable workflow | CLI opens UI, connect, list tables, run a read query, stream results, cancel | End-to-end workflow works on both MySQL and MariaDB; errors leave the app usable |
+| 2. First usable workflow | CLI opens UI, connect, list tables, run a read query, stream results, cancel | End-to-end workflow works on PostgreSQL, MySQL, and MariaDB; errors leave the app usable |
 | 3. Daily-use features | Paging/filtering, schema completion, cell inspection, copy, CSV, profiles/history | Exact datatype fixtures survive display/copy/export; result limits are visible and honored |
 | 4. Reliability | Local authentication, TLS failures, read-only policy, cleanup, bounded concurrency, keyboard access | Integration and browser tests pass; repeated operations do not accumulate resources |
 | 5. Release | macOS arm64 and amd64 builds, checksums, install/uninstall instructions, supported-server matrix, benchmark report | Clean-machine smoke tests; no runtime dependency installation; documented limits match observed behavior |
 
-Establish a narrow, explicitly tested server matrix in milestone 1, starting with MySQL 8.4 and MariaDB 11.4 as proposed baselines. Add other versions only after integration tests. Test Safari and Chromium on macOS. Packaging should assess Gatekeeper/signing requirements early; signing/notarization depends on available developer credentials. The Keychain integration may require platform bindings, so validate build requirements before claiming a completely static executable. Review dependency licenses and include required notices; choose the project's open-source license before publishing.
+Establish a narrow, explicitly tested server matrix, starting with PostgreSQL 17, MySQL 8.4, and MariaDB 11.4 as proposed baselines. Add other versions only after integration tests. Test Safari and Chromium on macOS. Packaging should assess Gatekeeper/signing requirements early; signing/notarization depends on available developer credentials. The Keychain integration may require platform bindings, so validate build requirements before claiming a completely static executable. Review dependency licenses and include required notices; choose the project's open-source license before publishing.
 
 Do not set a calendar estimate until milestone 1 resolves parser coverage, cancellation, and packaging. Each milestone should leave a runnable build; feature work follows the verified memory and execution design.
 

@@ -31,6 +31,7 @@ type TLSProfile struct {
 type Profile struct {
 	ID        string     `json:"id"`
 	Name      string     `json:"name"`
+	Engine    string     `json:"engine"`
 	Host      string     `json:"host"`
 	Port      int        `json:"port"`
 	User      string     `json:"user"`
@@ -44,6 +45,7 @@ type Profile struct {
 type HistoryEntry struct {
 	ID         string    `json:"id"`
 	SQL        string    `json:"sql"`
+	Engine     string    `json:"engine,omitempty"`
 	Database   string    `json:"database,omitempty"`
 	Server     string    `json:"server,omitempty"`
 	ExecutedAt time.Time `json:"executedAt"`
@@ -90,6 +92,11 @@ func Open(path string) (*Store, error) {
 	if s.data.Profiles == nil {
 		s.data.Profiles = []Profile{}
 	}
+	for i := range s.data.Profiles {
+		if s.data.Profiles[i].Engine == "" {
+			s.data.Profiles[i].Engine = "mysql"
+		}
+	}
 	if s.data.History == nil {
 		s.data.History = []HistoryEntry{}
 	}
@@ -125,6 +132,9 @@ func (s *Store) SaveProfile(profile Profile) (Profile, error) {
 	defer s.mu.Unlock()
 
 	now := time.Now().UTC()
+	if profile.Engine == "" {
+		profile.Engine = "mysql"
+	}
 	profile.ID = strings.TrimSpace(profile.ID)
 	if profile.ID == "" {
 		profile.ID = newID()

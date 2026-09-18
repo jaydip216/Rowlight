@@ -1,11 +1,11 @@
 .PHONY: build frontend test dev-backend clean
 
-GOCACHE ?= /tmp/db0-gocache
-GOMODCACHE ?= /tmp/db0-gomodcache
+GOCACHE ?= /tmp/rowlight-gocache
+GOMODCACHE ?= /tmp/rowlight-gomodcache
 
 build: frontend
 	mkdir -p bin
-	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) go build -trimpath -ldflags="-s -w" -o bin/db0 .
+	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) go build -trimpath -ldflags="-s -w" -o bin/rowlight .
 
 frontend:
 	npm --prefix web ci

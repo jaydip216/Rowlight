@@ -36,6 +36,47 @@ func TestBuildBrowseQuery(t *testing.T) {
 	}
 }
 
+func TestBuildPostgresBrowseQuery(t *testing.T) {
+	t.Parallel()
+	columns := []BrowseColumn{{Name: "id"}, {Name: `display"name`}, {Name: "notes"}}
+	req := BrowseRequest{
+		Schema: `app"data`, Table: `users"archive`, Offset: 10, PageSize: 25,
+		Sort: &BrowseSort{Column: `display"name`, Direction: "desc"},
+		Filters: []BrowseFilter{
+			{Column: "id", Operator: "equals", Value: stringPointer("7")},
+			{Column: `display"name`, Operator: "contains", Value: stringPointer("%x_")},
+			{Column: "notes", Operator: "startsWith", Value: stringPointer("hello")},
+		},
+	}
+
+	query, args, err := buildBrowseQueryForEngine(EnginePostgres, req, columns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantQuery := `SELECT "id", "display""name", "notes" FROM "app""data"."users""archive" WHERE "id" = $1 AND POSITION($2 IN CAST("display""name" AS TEXT)) > 0 AND LEFT(CAST("notes" AS TEXT), CHAR_LENGTH($3)) = $4 ORDER BY "display""name" DESC LIMIT $5 OFFSET $6`
+	if query != wantQuery {
+		t.Fatalf("query = %q\nwant    %q", query, wantQuery)
+	}
+	wantArgs := []any{"7", "%x_", "hello", "hello", 26, 10}
+	if !reflect.DeepEqual(args, wantArgs) {
+		t.Fatalf("args = %#v, want %#v", args, wantArgs)
+	}
+}
+
+func TestNormalizeEngine(t *testing.T) {
+	t.Parallel()
+	tests := map[string]string{
+		"": EngineMySQL, "mysql": EngineMySQL, "MariaDB": EngineMySQL,
+		"postgres": EnginePostgres, "PostgreSQL": EnginePostgres,
+		"oracle": "oracle",
+	}
+	for input, want := range tests {
+		if got := normalizeEngine(input); got != want {
+			t.Errorf("normalizeEngine(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestBuildBrowseQueryRejectsUntrustedFragments(t *testing.T) {
 	t.Parallel()
 	columns := []BrowseColumn{{Name: "id"}, {Name: "name"}}

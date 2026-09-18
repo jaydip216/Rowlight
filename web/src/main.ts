@@ -1,13 +1,13 @@
 import "./styles.css";
 import { api } from "./api";
-import { createEditor, selectedQuery, setQuery } from "./editor";
+import { createEditor, selectedQuery, setEditorEngine, setQuery } from "./editor";
 import { ResultGrid } from "./grid";
-import type { BrowseFilterOperator, BrowseRequest, ColumnItem, Connection, ConnectionInput, ConnectionProfile, QueryEvent, QueryHistoryEntry, TableItem, TLSMode } from "./types";
+import type { BrowseFilterOperator, BrowseRequest, ColumnItem, Connection, ConnectionInput, ConnectionProfile, DatabaseEngine, QueryEvent, QueryHistoryEntry, TableItem, TLSMode } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
   <header class="app-header">
-    <div class="brand"><span class="brand-mark">d0</span><span>db0</span></div>
+    <div class="brand"><span class="brand-mark">RL</span><span>Rowlight</span></div>
     <div class="connection-state"><span class="status-dot"></span><span id="connection-label">Not connected</span></div>
     <button id="disconnect" class="button ghost hidden">Disconnect</button>
   </header>
@@ -15,16 +15,22 @@ app.innerHTML = `
     <section id="connect-view" class="connect-view">
       <form id="connection-form" class="connection-card">
         <div class="eyebrow">NEW CONNECTION</div>
-        <h1>Connect to MySQL</h1>
+        <h1 id="connection-title">Connect to MySQL / MariaDB</h1>
         <p class="muted">Connections are read-only by default. Credentials stay in backend memory.</p>
         <div class="profile-picker">
           <select id="saved-profile" aria-label="Saved connection profile"><option value="">New connection</option></select>
           <button id="delete-profile" type="button" class="button secondary" disabled>Delete</button>
         </div>
         <div class="form-grid">
+          <label class="wide">Database engine
+            <select name="engine">
+              <option value="mysql" selected>MySQL / MariaDB</option>
+              <option value="postgres">PostgreSQL</option>
+            </select>
+          </label>
           <label class="wide">Host<input name="host" value="127.0.0.1" required autocomplete="off"></label>
           <label>Port<input name="port" type="number" value="3306" min="1" max="65535" required></label>
-          <label>Database<input name="database" placeholder="Optional" autocomplete="off"></label>
+          <label><span id="database-label">Database</span><input name="database" placeholder="Optional" autocomplete="off"></label>
           <label>Username<input name="user" required autocomplete="username"></label>
           <label>Password<input name="password" type="password" autocomplete="current-password"></label>
           <label class="wide">TLS
@@ -53,7 +59,7 @@ app.innerHTML = `
     </section>
     <section id="workspace" class="workspace hidden">
       <aside class="sidebar">
-        <div class="sidebar-header"><span>DATABASES</span><button id="refresh-schema" class="icon-button" title="Refresh schema">↻</button></div>
+        <div class="sidebar-header"><span id="schema-heading">DATABASES</span><button id="refresh-schema" class="icon-button" title="Refresh schema">↻</button></div>
         <input id="schema-filter" class="schema-filter" placeholder="Filter objects…" aria-label="Filter database objects">
         <div id="schema-tree" class="schema-tree"></div>
       </aside>
@@ -128,17 +134,32 @@ const tableCache = new Map<string, TableItem[]>();
 const columnCache = new Map<string, ColumnItem[]>();
 let profiles: ConnectionProfile[] = [];
 let historyEntries: QueryHistoryEntry[] = [];
-const activeConnectionKey = "db0-active-connection";
+const activeConnectionKey = "rowlight-active-connection";
 type BrowseState = { schema: string; table: string; offset: number; pageSize: number; hasMore: boolean };
 let browseState: BrowseState | null = null;
 let browseLoading = false;
 
 const editor = createEditor($("#editor"), () => void runQuery(), () => [...schemaNames]);
 
+function selectedEngine(): DatabaseEngine {
+  return (form.elements.namedItem("engine") as HTMLSelectElement).value as DatabaseEngine;
+}
+
+function updateEngineUI(resetPort = false): void {
+  const engine = selectedEngine();
+  const port = form.elements.namedItem("port") as HTMLInputElement;
+  if (resetPort || !port.value) port.value = engine === "postgres" ? "5432" : "3306";
+  $("#connection-title").textContent = engine === "postgres" ? "Connect to PostgreSQL" : "Connect to MySQL / MariaDB";
+  $("#database-label").textContent = engine === "postgres" ? "Database" : "Default database";
+  $("#schema-heading").textContent = engine === "postgres" ? "SCHEMAS" : "DATABASES";
+  setEditorEngine(editor, engine);
+}
+
 function connectionInput(): ConnectionInput {
   const data = new FormData(form);
   const tlsMode = String(data.get("tlsMode")) as TLSMode;
   return {
+    engine: selectedEngine(),
     host: String(data.get("host")), port: Number(data.get("port")), user: String(data.get("user")),
     password: String(data.get("password")), database: String(data.get("database")),
     tls: {
@@ -159,6 +180,7 @@ async function loadProfiles(selectedID = ""): Promise<void> {
 }
 
 function applyProfile(profile: ConnectionProfile): void {
+  setFormValue("engine", profile.engine ?? "mysql");
   setFormValue("host", profile.host);
   setFormValue("port", String(profile.port));
   setFormValue("user", profile.user);
@@ -171,6 +193,7 @@ function applyProfile(profile: ConnectionProfile): void {
   setFormValue("clientKeyPem", "");
   setFormValue("profileName", profile.name);
   (form.elements.namedItem("saveProfile") as HTMLInputElement).checked = false;
+  updateEngineUI();
   $("select[name=tlsMode]").dispatchEvent(new Event("change"));
 }
 
@@ -188,6 +211,7 @@ async function saveSelectedProfile(input: ConnectionInput): Promise<void> {
   const saved = await api.saveProfile({
     id: existing?.id,
     name,
+    engine: input.engine,
     host: input.host,
     port: input.port,
     user: input.user,
@@ -230,10 +254,11 @@ async function connect(): Promise<void> {
   try {
     const input = connectionInput();
     connection = await api.connect(input);
+    connection.engine ??= input.engine;
     sessionStorage.setItem(activeConnectionKey, JSON.stringify(connection));
     try { await saveSelectedProfile(input); }
     catch (error) { showError(connectionError, error); }
-    activeDatabase = connection.database;
+    activeDatabase = connection.engine === "postgres" ? "" : connection.database;
     $("#connection-label").textContent = `${connection.serverVersion} · read only`;
     $(".status-dot").classList.add("online");
     $("#disconnect").classList.remove("hidden");
@@ -252,8 +277,11 @@ async function restoreConnection(): Promise<boolean> {
   try {
     const remembered = JSON.parse(saved) as Connection;
     connection = await api.connection(remembered.id);
+    connection.engine ??= remembered.engine ?? "mysql";
+    setFormValue("engine", connection.engine);
+    updateEngineUI();
     sessionStorage.setItem(activeConnectionKey, JSON.stringify(connection));
-    activeDatabase = connection.database;
+    activeDatabase = connection.engine === "postgres" ? "" : connection.database;
     $("#connection-label").textContent = `${connection.serverVersion} · read only`;
     $(".status-dot").classList.add("online");
     $("#disconnect").classList.remove("hidden");
@@ -278,7 +306,9 @@ async function loadDatabases(): Promise<void> {
     items.forEach(({ name }) => schemaNames.add(name));
     tree.replaceChildren(...items.map(({ name }) => databaseNode(name)));
     if (!activeDatabase && items[0]) {
-      activeDatabase = items[0].name;
+      activeDatabase = connection.engine === "postgres"
+        ? (items.find(({ name }) => name === "public")?.name ?? items[0].name)
+        : items[0].name;
       updateActiveDatabase();
     }
   } catch (error) { tree.innerHTML = `<div class="tree-error"></div>`; showError(tree.firstElementChild as HTMLElement, error); }
@@ -315,12 +345,12 @@ function tableNode(database: string, table: TableItem): HTMLElement {
   const details = document.createElement("details");
   details.className = "tree-table"; details.dataset.search = `${database} ${table.name}`.toLowerCase();
   const summary = document.createElement("summary");
-  summary.innerHTML = `<span class="table-icon">▦</span><span class="tree-table-name" title="Click to browse rows"></span><small></small><button type="button" class="tree-browse" title="Browse the first 200 rows">Browse</button>`;
+  summary.innerHTML = `<span class="table-icon">▦</span><span class="tree-table-name" title="Click to browse rows"></span><small></small><button type="button" class="tree-browse" title="Browse rows">Browse</button>`;
   summary.children[1]!.textContent = table.name; summary.children[2]!.textContent = table.type;
   const browseTable = () => {
     activeDatabase = database;
     updateActiveDatabase();
-    setQuery(editor, `SELECT *\nFROM ${quoteIdentifier(database)}.${quoteIdentifier(table.name)}\nLIMIT 200;`);
+    setQuery(editor, `SELECT *\nFROM ${quoteIdentifier(database)}.${quoteIdentifier(table.name)}\nLIMIT 100;`);
     void startBrowse(database, table.name);
   };
   summary.querySelector<HTMLElement>(".tree-table-name")!.addEventListener("click", (event) => {
@@ -363,10 +393,12 @@ async function loadColumns(container: HTMLDetailsElement, database: string, tabl
 }
 
 function updateActiveDatabase(): void {
-  $("#active-database").textContent = activeDatabase || "No database selected";
+  const engine = connection?.engine ?? selectedEngine();
+  $("#active-database").textContent = activeDatabase || (engine === "postgres" ? "No schema selected" : "No database selected");
 }
 
 function quoteIdentifier(value: string): string {
+  if ((connection?.engine ?? selectedEngine()) === "postgres") return `"${value.replaceAll('"', '""')}"`;
   return `\`${value.replaceAll("`", "``")}\``;
 }
 
@@ -484,7 +516,7 @@ function exportResults(): void {
   const link = document.createElement("a");
   const suffix = new Date().toISOString().replaceAll(":", "-").replace("T", "_").slice(0, 19);
   link.href = url;
-  link.download = `db0-results_${suffix}.csv`;
+  link.download = `rowlight-results_${suffix}.csv`;
   document.body.append(link);
   link.click();
   link.remove();
@@ -522,6 +554,7 @@ $("select[name=tlsMode]").addEventListener("change", (event) => {
   $("#tls-fields").classList.toggle("hidden", mode !== "custom" && mode !== "mutual");
   document.querySelectorAll(".mutual-field").forEach((item) => item.classList.toggle("hidden", mode !== "mutual"));
 });
+$("select[name=engine]").addEventListener("change", () => updateEngineUI(true));
 $("#disconnect").addEventListener("click", async () => {
   if (connection) await api.disconnect(connection.id).catch(() => undefined);
   connection = null; tableCache.clear(); columnCache.clear(); schemaNames.clear();

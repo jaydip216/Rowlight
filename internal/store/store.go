@@ -17,12 +17,20 @@ import (
 	"unicode"
 
 	mysql "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
+)
+
+const (
+	EngineMySQL    = "mysql"
+	EnginePostgres = "postgres"
 )
 
 var (
-	ErrNotFound       = errors.New("connection not found")
-	ErrInvalidBrowse  = errors.New("invalid browse request")
-	ErrBrowseNotFound = errors.New("table or view not found")
+	ErrNotFound          = errors.New("connection not found")
+	ErrInvalidConnection = errors.New("invalid connection request")
+	ErrInvalidBrowse     = errors.New("invalid browse request")
+	ErrBrowseNotFound    = errors.New("table or view not found")
 )
 
 type TLSRequest struct {
@@ -34,6 +42,7 @@ type TLSRequest struct {
 }
 
 type ConnectionRequest struct {
+	Engine   string     `json:"engine"`
 	Host     string     `json:"host"`
 	Port     int        `json:"port"`
 	User     string     `json:"user"`
@@ -44,6 +53,7 @@ type ConnectionRequest struct {
 
 type Connection struct {
 	ID            string `json:"id"`
+	Engine        string `json:"engine"`
 	ServerVersion string `json:"serverVersion"`
 	Database      string `json:"database"`
 	db            *sql.DB
@@ -51,6 +61,7 @@ type Connection struct {
 }
 
 type ConnectionInfo struct {
+	Engine        string
 	ServerVersion string
 	Database      string
 }
@@ -128,60 +139,40 @@ func New() *Store {
 
 func (s *Store) Connect(ctx context.Context, req ConnectionRequest) (*Connection, error) {
 	if strings.TrimSpace(req.Host) == "" || strings.TrimSpace(req.User) == "" {
-		return nil, errors.New("host and user are required")
+		return nil, fmt.Errorf("%w: host and user are required", ErrInvalidConnection)
+	}
+	req.Engine = normalizeEngine(req.Engine)
+	if req.Engine != EngineMySQL && req.Engine != EnginePostgres {
+		return nil, fmt.Errorf("%w: engine must be mysql or postgres", ErrInvalidConnection)
 	}
 	if req.Port == 0 {
-		req.Port = 3306
+		if req.Engine == EnginePostgres {
+			req.Port = 5432
+		} else {
+			req.Port = 3306
+		}
 	}
 	if req.Port < 1 || req.Port > 65535 {
-		return nil, errors.New("port must be between 1 and 65535")
+		return nil, fmt.Errorf("%w: port must be between 1 and 65535", ErrInvalidConnection)
 	}
-
-	cfg := mysql.NewConfig()
-	cfg.Net = "tcp"
-	cfg.Addr = net.JoinHostPort(req.Host, strconv.Itoa(req.Port))
-	cfg.User = req.User
-	cfg.Passwd = req.Password
-	cfg.DBName = req.Database
-	cfg.MultiStatements = false
-	cfg.AllowNativePasswords = true
-	cfg.Timeout = 10 * time.Second
-	cfg.ReadTimeout = 0
-	cfg.WriteTimeout = 0
-	cfg.Params = map[string]string{"charset": "utf8mb4"}
 
 	if req.TLS.Mode == "" {
 		req.TLS.Mode = "system"
 	}
-	var tlsName string
-	if req.TLS.Mode != "disabled" {
-		if req.TLS.Mode != "system" && req.TLS.Mode != "custom" && req.TLS.Mode != "mutual" {
-			return nil, errors.New("TLS mode must be disabled, system, custom, or mutual")
-		}
-		if (req.TLS.Mode == "custom" || req.TLS.Mode == "mutual") && req.TLS.CAPEM == "" {
-			return nil, errors.New("custom and mutual TLS require a CA certificate")
-		}
-		if req.TLS.Mode == "mutual" && (req.TLS.ClientCertPEM == "" || req.TLS.ClientKeyPEM == "") {
-			return nil, errors.New("mutual TLS requires a client certificate and key")
-		}
-		name := "db0-" + s.nextID()
-		tlsCfg, err := makeTLSConfig(req.Host, req.TLS)
-		if err != nil {
-			return nil, err
-		}
-		if err := mysql.RegisterTLSConfig(name, tlsCfg); err != nil {
-			return nil, fmt.Errorf("register TLS configuration: %w", err)
-		}
-		cfg.TLSConfig = name
-		tlsName = name
+	if err := validateTLSRequest(req.TLS); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidConnection, err)
 	}
 
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	var db *sql.DB
+	var tlsName string
+	var err error
+	if req.Engine == EnginePostgres {
+		db, err = openPostgres(req)
+	} else {
+		db, tlsName, err = s.openMySQL(req)
+	}
 	if err != nil {
-		if tlsName != "" {
-			mysql.DeregisterTLSConfig(tlsName)
-		}
-		return nil, fmt.Errorf("configure connection: %w", err)
+		return nil, err
 	}
 	db.SetMaxOpenConns(3)
 	db.SetMaxIdleConns(1)
@@ -195,18 +186,109 @@ func (s *Store) Connect(ctx context.Context, req ConnectionRequest) (*Connection
 	}
 
 	var version, database sql.NullString
-	if err := db.QueryRowContext(ctx, "SELECT VERSION(), DATABASE()").Scan(&version, &database); err != nil {
+	infoQuery := "SELECT VERSION(), DATABASE()"
+	if req.Engine == EnginePostgres {
+		infoQuery = "SELECT VERSION(), current_database()"
+	}
+	if err := db.QueryRowContext(ctx, infoQuery).Scan(&version, &database); err != nil {
 		db.Close()
 		if tlsName != "" {
 			mysql.DeregisterTLSConfig(tlsName)
 		}
 		return nil, fmt.Errorf("read server information: %w", err)
 	}
-	c := &Connection{ID: s.nextID(), ServerVersion: version.String, Database: database.String, db: db, tlsName: tlsName}
+	c := &Connection{ID: s.nextID(), Engine: req.Engine, ServerVersion: version.String, Database: database.String, db: db, tlsName: tlsName}
 	s.mu.Lock()
 	s.connections[c.ID] = c
 	s.mu.Unlock()
 	return c, nil
+}
+
+func normalizeEngine(engine string) string {
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case "", "mysql", "mariadb":
+		return EngineMySQL
+	case "postgres", "postgresql":
+		return EnginePostgres
+	default:
+		return strings.ToLower(strings.TrimSpace(engine))
+	}
+}
+
+func validateTLSRequest(req TLSRequest) error {
+	if req.Mode != "disabled" && req.Mode != "system" && req.Mode != "custom" && req.Mode != "mutual" {
+		return errors.New("TLS mode must be disabled, system, custom, or mutual")
+	}
+	if (req.Mode == "custom" || req.Mode == "mutual") && req.CAPEM == "" {
+		return errors.New("custom and mutual TLS require a CA certificate")
+	}
+	if req.Mode == "mutual" && (req.ClientCertPEM == "" || req.ClientKeyPEM == "") {
+		return errors.New("mutual TLS requires a client certificate and key")
+	}
+	return nil
+}
+
+func (s *Store) openMySQL(req ConnectionRequest) (*sql.DB, string, error) {
+	cfg := mysql.NewConfig()
+	cfg.Net = "tcp"
+	cfg.Addr = net.JoinHostPort(req.Host, strconv.Itoa(req.Port))
+	cfg.User = req.User
+	cfg.Passwd = req.Password
+	cfg.DBName = req.Database
+	cfg.MultiStatements = false
+	cfg.AllowNativePasswords = true
+	cfg.Timeout = 10 * time.Second
+	cfg.ReadTimeout = 0
+	cfg.WriteTimeout = 0
+	cfg.Params = map[string]string{"charset": "utf8mb4"}
+
+	var tlsName string
+	if req.TLS.Mode != "disabled" {
+		name := "rowlight-" + s.nextID()
+		tlsCfg, err := makeTLSConfig(req.Host, req.TLS)
+		if err != nil {
+			return nil, "", err
+		}
+		if err := mysql.RegisterTLSConfig(name, tlsCfg); err != nil {
+			return nil, "", fmt.Errorf("register TLS configuration: %w", err)
+		}
+		cfg.TLSConfig = name
+		tlsName = name
+	}
+
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		if tlsName != "" {
+			mysql.DeregisterTLSConfig(tlsName)
+		}
+		return nil, "", fmt.Errorf("configure connection: %w", err)
+	}
+	return db, tlsName, nil
+}
+
+func openPostgres(req ConnectionRequest) (*sql.DB, error) {
+	cfg, err := pgx.ParseConfig("sslmode=disable")
+	if err != nil {
+		return nil, fmt.Errorf("configure PostgreSQL connection: %w", err)
+	}
+	cfg.Host = req.Host
+	cfg.Port = uint16(req.Port)
+	cfg.User = req.User
+	cfg.Password = req.Password
+	cfg.Database = req.Database
+	if cfg.Database == "" {
+		cfg.Database = req.User
+	}
+	cfg.ConnectTimeout = 10 * time.Second
+	cfg.Fallbacks = nil
+	if req.TLS.Mode != "disabled" {
+		tlsCfg, err := makeTLSConfig(req.Host, req.TLS)
+		if err != nil {
+			return nil, err
+		}
+		cfg.TLSConfig = tlsCfg
+	}
+	return stdlib.OpenDB(*cfg), nil
 }
 
 func makeTLSConfig(host string, req TLSRequest) (*tls.Config, error) {
@@ -286,7 +368,7 @@ func (s *Store) Info(id string) (ConnectionInfo, error) {
 	if err != nil {
 		return ConnectionInfo{}, err
 	}
-	return ConnectionInfo{ServerVersion: c.ServerVersion, Database: c.Database}, nil
+	return ConnectionInfo{Engine: c.Engine, ServerVersion: c.ServerVersion, Database: c.Database}, nil
 }
 
 func (s *Store) Schemas(ctx context.Context, id string) ([]string, error) {
@@ -294,7 +376,11 @@ func (s *Store) Schemas(ctx context.Context, id string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := c.db.QueryContext(ctx, `SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME`)
+	query := `SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME`
+	if c.Engine == EnginePostgres {
+		query = `SELECT schema_name FROM information_schema.schemata WHERE schema_name <> 'information_schema' AND schema_name NOT LIKE 'pg\_%' ESCAPE '\' ORDER BY schema_name`
+	}
+	rows, err := c.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +401,11 @@ func (s *Store) Tables(ctx context.Context, id, schema string) ([]Table, error) 
 	if err != nil {
 		return nil, err
 	}
-	rows, err := c.db.QueryContext(ctx, `SELECT TABLE_NAME, CASE TABLE_TYPE WHEN 'BASE TABLE' THEN 'table' WHEN 'VIEW' THEN 'view' ELSE LOWER(TABLE_TYPE) END FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME`, schema)
+	query := `SELECT TABLE_NAME, CASE TABLE_TYPE WHEN 'BASE TABLE' THEN 'table' WHEN 'VIEW' THEN 'view' ELSE LOWER(TABLE_TYPE) END FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME`
+	if c.Engine == EnginePostgres {
+		query = `SELECT table_name, CASE table_type WHEN 'BASE TABLE' THEN 'table' WHEN 'VIEW' THEN 'view' WHEN 'FOREIGN' THEN 'foreign table' ELSE LOWER(table_type) END FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name`
+	}
+	rows, err := c.db.QueryContext(ctx, query, schema)
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +426,26 @@ func (s *Store) Columns(ctx context.Context, id, schema, table string) ([]Column
 	if err != nil {
 		return nil, err
 	}
-	rows, err := c.db.QueryContext(ctx, `SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`, schema, table)
+	query := `SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`
+	if c.Engine == EnginePostgres {
+		query = `SELECT c.column_name, c.data_type, c.udt_name, c.is_nullable,
+			CASE WHEN EXISTS (
+				SELECT 1 FROM information_schema.table_constraints tc
+				JOIN information_schema.key_column_usage kcu
+				  ON tc.constraint_catalog = kcu.constraint_catalog
+				 AND tc.constraint_schema = kcu.constraint_schema
+				 AND tc.constraint_name = kcu.constraint_name
+				WHERE tc.constraint_type = 'PRIMARY KEY'
+				  AND tc.table_schema = c.table_schema AND tc.table_name = c.table_name
+				  AND kcu.column_name = c.column_name
+			) THEN 'PRI' ELSE '' END,
+			c.column_default,
+			CASE WHEN c.is_identity = 'YES' THEN 'identity' WHEN c.is_generated = 'ALWAYS' THEN 'generated' ELSE '' END
+		FROM information_schema.columns c
+		WHERE c.table_schema = $1 AND c.table_name = $2
+		ORDER BY c.ordinal_position`
+	}
+	rows, err := c.db.QueryContext(ctx, query, schema, table)
 	if err != nil {
 		return nil, err
 	}
@@ -379,14 +488,14 @@ func (s *Store) Browse(ctx context.Context, connectionID string, req BrowseReque
 	}
 	defer tx.Rollback()
 
-	columns, err := browseColumns(ctx, tx, req.Schema, req.Table)
+	columns, err := browseColumns(ctx, tx, c.Engine, req.Schema, req.Table)
 	if err != nil {
 		return BrowseResult{}, err
 	}
 	if len(columns) == 0 {
 		return BrowseResult{}, fmt.Errorf("%w: %s.%s", ErrBrowseNotFound, req.Schema, req.Table)
 	}
-	query, args, err := buildBrowseQuery(req, columns)
+	query, args, err := buildBrowseQueryForEngine(c.Engine, req, columns)
 	if err != nil {
 		return BrowseResult{}, err
 	}
@@ -432,7 +541,7 @@ func (s *Store) Browse(ctx context.Context, connectionID string, req BrowseReque
 		}
 		row := make([]any, len(values))
 		for i, value := range values {
-			converted, size, _ := transportValue(value, maxCellBytes)
+			converted, size, _ := transportValueForType(value, columnTypes[i].DatabaseTypeName(), maxCellBytes)
 			row[i] = converted
 			totalBytes += size
 		}
@@ -448,8 +557,12 @@ type browseQuerier interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-func browseColumns(ctx context.Context, queryer browseQuerier, schema, table string) ([]BrowseColumn, error) {
-	rows, err := queryer.QueryContext(ctx, `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`, schema, table)
+func browseColumns(ctx context.Context, queryer browseQuerier, engine, schema, table string) ([]BrowseColumn, error) {
+	query := `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`
+	if engine == EnginePostgres {
+		query = `SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`
+	}
+	rows, err := queryer.QueryContext(ctx, query, schema, table)
 	if err != nil {
 		return nil, err
 	}
@@ -487,39 +600,60 @@ func normalizeBrowseRequest(req *BrowseRequest) error {
 }
 
 func buildBrowseQuery(req BrowseRequest, columns []BrowseColumn) (string, []any, error) {
+	return buildBrowseQueryForEngine(EngineMySQL, req, columns)
+}
+
+func buildBrowseQueryForEngine(engine string, req BrowseRequest, columns []BrowseColumn) (string, []any, error) {
 	knownColumns := make(map[string]struct{}, len(columns))
 	quotedColumns := make([]string, len(columns))
 	for i, column := range columns {
 		knownColumns[column.Name] = struct{}{}
-		quotedColumns[i] = quoteIdentifier(column.Name)
+		quotedColumns[i] = quoteIdentifierForEngine(engine, column.Name)
 	}
-	query := "SELECT " + strings.Join(quotedColumns, ", ") + " FROM " + quoteIdentifier(req.Schema) + "." + quoteIdentifier(req.Table)
+	query := "SELECT " + strings.Join(quotedColumns, ", ") + " FROM " + quoteIdentifierForEngine(engine, req.Schema) + "." + quoteIdentifierForEngine(engine, req.Table)
 	conditions := make([]string, 0, len(req.Filters))
 	args := make([]any, 0, len(req.Filters)+2)
+	placeholder := func() string {
+		if engine == EnginePostgres {
+			return "$" + strconv.Itoa(len(args)+1)
+		}
+		return "?"
+	}
 	for _, filter := range req.Filters {
 		if _, ok := knownColumns[filter.Column]; !ok {
 			return "", nil, fmt.Errorf("%w: unknown filter column %q", ErrInvalidBrowse, filter.Column)
 		}
-		column := quoteIdentifier(filter.Column)
+		column := quoteIdentifierForEngine(engine, filter.Column)
 		switch filter.Operator {
 		case "equals":
 			if filter.Value == nil {
 				return "", nil, fmt.Errorf("%w: equals requires a value", ErrInvalidBrowse)
 			}
-			conditions = append(conditions, column+" = ?")
+			conditions = append(conditions, column+" = "+placeholder())
 			args = append(args, *filter.Value)
 		case "contains":
 			if filter.Value == nil {
 				return "", nil, fmt.Errorf("%w: contains requires a value", ErrInvalidBrowse)
 			}
-			conditions = append(conditions, "LOCATE(?, "+column+") > 0")
+			if engine == EnginePostgres {
+				conditions = append(conditions, "POSITION("+placeholder()+" IN CAST("+column+" AS TEXT)) > 0")
+			} else {
+				conditions = append(conditions, "LOCATE("+placeholder()+", "+column+") > 0")
+			}
 			args = append(args, *filter.Value)
 		case "startsWith":
 			if filter.Value == nil {
 				return "", nil, fmt.Errorf("%w: startsWith requires a value", ErrInvalidBrowse)
 			}
-			conditions = append(conditions, "LEFT("+column+", CHAR_LENGTH(?)) = ?")
-			args = append(args, *filter.Value, *filter.Value)
+			firstPlaceholder := placeholder()
+			args = append(args, *filter.Value)
+			secondPlaceholder := placeholder()
+			if engine == EnginePostgres {
+				conditions = append(conditions, "LEFT(CAST("+column+" AS TEXT), CHAR_LENGTH("+firstPlaceholder+")) = "+secondPlaceholder)
+			} else {
+				conditions = append(conditions, "LEFT("+column+", CHAR_LENGTH("+firstPlaceholder+")) = "+secondPlaceholder)
+			}
+			args = append(args, *filter.Value)
 		case "isNull":
 			if filter.Value != nil {
 				return "", nil, fmt.Errorf("%w: isNull does not accept a value", ErrInvalidBrowse)
@@ -545,14 +679,26 @@ func buildBrowseQuery(req BrowseRequest, columns []BrowseColumn) (string, []any,
 		if direction != "ASC" && direction != "DESC" {
 			return "", nil, fmt.Errorf("%w: sort direction must be asc or desc", ErrInvalidBrowse)
 		}
-		query += " ORDER BY " + quoteIdentifier(req.Sort.Column) + " " + direction
+		query += " ORDER BY " + quoteIdentifierForEngine(engine, req.Sort.Column) + " " + direction
 	}
-	query += " LIMIT ? OFFSET ?"
+	query += " LIMIT " + placeholder()
 	args = append(args, req.PageSize+1, req.Offset)
+	if engine == EnginePostgres {
+		query += " OFFSET $" + strconv.Itoa(len(args))
+	} else {
+		query += " OFFSET ?"
+	}
 	return query, args, nil
 }
 
 func quoteIdentifier(value string) string {
+	return quoteIdentifierForEngine(EngineMySQL, value)
+}
+
+func quoteIdentifierForEngine(engine, value string) string {
+	if engine == EnginePostgres {
+		return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+	}
 	return "`" + strings.ReplaceAll(value, "`", "``") + "`"
 }
 
@@ -561,7 +707,7 @@ func (s *Store) StreamQuery(parent context.Context, connectionID string, req Que
 	if err != nil {
 		return err
 	}
-	if err := ValidateReadOnlySQL(req.SQL); err != nil {
+	if err := ValidateReadOnlySQLForEngine(c.Engine, req.SQL); err != nil {
 		return err
 	}
 	maxRows := req.MaxRows
@@ -642,7 +788,7 @@ func (s *Store) StreamQuery(parent context.Context, connectionID string, req Que
 		}
 		row := make([]any, len(values))
 		for i, value := range values {
-			converted, size, cellTruncated := transportValue(value, maxCellBytes)
+			converted, size, cellTruncated := transportValueForType(value, columnTypes[i].DatabaseTypeName(), maxCellBytes)
 			row[i] = converted
 			totalBytes += size
 			truncated = truncated || cellTruncated
@@ -668,6 +814,10 @@ func (s *Store) StreamQuery(parent context.Context, connectionID string, req Que
 }
 
 func transportValue(value any, max int) (any, int, bool) {
+	return transportValueForType(value, "", max)
+}
+
+func transportValueForType(value any, databaseType string, max int) (any, int, bool) {
 	if value == nil {
 		return nil, 0, false
 	}
@@ -684,13 +834,22 @@ func transportValue(value any, max int) (any, int, bool) {
 	if truncated {
 		b = b[:max]
 	}
-	if !isText(b) {
+	if isBinaryDatabaseType(databaseType) || !isText(b) {
 		return map[string]any{"encoding": "base64", "data": base64.StdEncoding.EncodeToString(b), "truncated": truncated}, len(b), truncated
 	}
 	if truncated {
 		return map[string]any{"encoding": "utf8", "data": string(b), "truncated": true}, len(b), true
 	}
 	return string(b), len(b), truncated
+}
+
+func isBinaryDatabaseType(databaseType string) bool {
+	switch strings.ToUpper(strings.TrimSpace(databaseType)) {
+	case "BYTEA", "BINARY", "VARBINARY", "TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB", "BIT":
+		return true
+	default:
+		return false
+	}
 }
 
 func isText(b []byte) bool {

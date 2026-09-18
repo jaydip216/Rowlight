@@ -10,10 +10,10 @@ import (
 )
 
 func TestMariaDBIntegration(t *testing.T) {
-	if os.Getenv("DB0_INTEGRATION") == "" {
-		t.Skip("set DB0_INTEGRATION=1 and DB0_TEST_* to run against MySQL/MariaDB")
+	if os.Getenv("ROWLIGHT_INTEGRATION") == "" {
+		t.Skip("set ROWLIGHT_INTEGRATION=1 and ROWLIGHT_TEST_* to run against MySQL/MariaDB")
 	}
-	port, err := strconv.Atoi(envOr("DB0_TEST_PORT", "3306"))
+	port, err := strconv.Atoi(envOr("ROWLIGHT_TEST_PORT", "3306"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,9 +22,9 @@ func TestMariaDBIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	c, err := s.Connect(ctx, ConnectionRequest{
-		Host: envOr("DB0_TEST_HOST", "127.0.0.1"), Port: port,
-		User: os.Getenv("DB0_TEST_USER"), Password: os.Getenv("DB0_TEST_PASSWORD"),
-		Database: os.Getenv("DB0_TEST_DATABASE"), TLS: TLSRequest{Mode: envOr("DB0_TEST_TLS", "disabled")},
+		Host: envOr("ROWLIGHT_TEST_HOST", "127.0.0.1"), Port: port,
+		User: os.Getenv("ROWLIGHT_TEST_USER"), Password: os.Getenv("ROWLIGHT_TEST_PASSWORD"),
+		Database: os.Getenv("ROWLIGHT_TEST_DATABASE"), TLS: TLSRequest{Mode: envOr("ROWLIGHT_TEST_TLS", "disabled")},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -48,14 +48,24 @@ func TestMariaDBIntegration(t *testing.T) {
 	}
 	browsed, err := s.Browse(ctx, c.ID, BrowseRequest{
 		Schema: c.Database, Table: "customers", PageSize: 1,
-		Sort:    &BrowseSort{Column: "id", Direction: "asc"},
-		Filters: []BrowseFilter{{Column: "email", Operator: "isNotNull"}},
+		Sort: &BrowseSort{Column: "id", Direction: "asc"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(browsed.Columns) < 6 || len(browsed.Rows) != 1 || !browsed.HasMore || browsed.PageSize != 1 {
 		t.Fatalf("Browse() = %+v", browsed)
+	}
+	filtered, err := s.Browse(ctx, c.ID, BrowseRequest{
+		Schema: c.Database, Table: "customers", PageSize: 10,
+		Sort:    &BrowseSort{Column: "id", Direction: "asc"},
+		Filters: []BrowseFilter{{Column: "email", Operator: "isNotNull"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered.Rows) != 1 || filtered.HasMore {
+		t.Fatalf("filtered Browse() = %+v", filtered)
 	}
 	if _, err := s.Browse(ctx, c.ID, BrowseRequest{Schema: c.Database, Table: "customers", PageSize: 10, Sort: &BrowseSort{Column: "not_a_column", Direction: "asc"}}); !errors.Is(err, ErrInvalidBrowse) {
 		t.Fatalf("Browse() unknown column error = %v, want ErrInvalidBrowse", err)

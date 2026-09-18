@@ -19,8 +19,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jaydip216/db0/internal/server"
-	appstate "github.com/jaydip216/db0/internal/state"
+	"github.com/jaydip216/Rowlight/internal/server"
+	appstate "github.com/jaydip216/Rowlight/internal/state"
 )
 
 //go:embed web/dist
@@ -48,7 +48,7 @@ func main() {
 	app := server.NewWithState(token, dist, persistent)
 	defer app.Close()
 	url := fmt.Sprintf("http://%s/#token=%s", ln.Addr().String(), token)
-	fmt.Printf("db0 listening at %s\n", url)
+	fmt.Printf("Rowlight listening at %s\n", url)
 	if !*noOpen {
 		if err := openBrowser(url); err != nil {
 			log.Printf("could not open browser: %v", err)
@@ -74,7 +74,7 @@ func openState() *appstate.Store {
 		log.Printf("persistent profiles and history disabled: %v", err)
 		return appstate.NewMemory()
 	}
-	persistent, err := appstate.Open(filepath.Join(configDir, "db0", "state.json"))
+	persistent, err := appstate.Open(filepath.Join(configDir, "Rowlight", "state.json"))
 	if err != nil {
 		log.Printf("persistent profiles and history disabled: %v", err)
 		return appstate.NewMemory()

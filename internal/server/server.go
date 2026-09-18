@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	appstate "github.com/jaydip216/db0/internal/state"
-	"github.com/jaydip216/db0/internal/store"
+	appstate "github.com/jaydip216/Rowlight/internal/state"
+	"github.com/jaydip216/Rowlight/internal/store"
 )
 
 type Server struct {
@@ -126,12 +126,20 @@ func (s *Server) saveProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	profile.Name = strings.TrimSpace(profile.Name)
+	profile.Engine = strings.ToLower(strings.TrimSpace(profile.Engine))
+	if profile.Engine == "" {
+		profile.Engine = store.EngineMySQL
+	}
 	profile.Host = strings.TrimSpace(profile.Host)
 	profile.User = strings.TrimSpace(profile.User)
 	profile.CreatedAt = time.Time{}
 	profile.UpdatedAt = time.Time{}
 	if profile.Name == "" || profile.Host == "" || profile.User == "" {
 		writeError(w, http.StatusBadRequest, "profile name, host, and user are required")
+		return
+	}
+	if profile.Engine != store.EngineMySQL && profile.Engine != store.EnginePostgres {
+		writeError(w, http.StatusBadRequest, "profile engine must be mysql or postgres")
 		return
 	}
 	if profile.Port < 1 || profile.Port > 65535 {
@@ -179,7 +187,7 @@ func (s *Server) createConnection(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	c, err := s.store.Connect(ctx, req)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeStoreError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, c)
@@ -192,7 +200,7 @@ func (s *Server) connection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"id": r.PathValue("id"), "serverVersion": info.ServerVersion, "database": info.Database,
+		"id": r.PathValue("id"), "engine": info.Engine, "serverVersion": info.ServerVersion, "database": info.Database,
 	})
 }
 
@@ -283,7 +291,7 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 	info, _ := s.store.Info(r.PathValue("id"))
 	executedAt := time.Now().UTC()
 	err := s.store.StreamQuery(r.Context(), r.PathValue("id"), req, write)
-	history := appstate.HistoryEntry{SQL: req.SQL, Database: info.Database, Server: info.ServerVersion, ExecutedAt: executedAt, ElapsedMS: elapsedMS, RowCount: rowCount, Truncated: truncated}
+	history := appstate.HistoryEntry{SQL: req.SQL, Engine: info.Engine, Database: info.Database, Server: info.ServerVersion, ExecutedAt: executedAt, ElapsedMS: elapsedMS, RowCount: rowCount, Truncated: truncated}
 	if err != nil {
 		history.Error = err.Error()
 		_ = write(map[string]any{"type": "error", "error": err.Error()})
@@ -363,6 +371,10 @@ func writeError(w http.ResponseWriter, status int, message string) {
 }
 
 func writeStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrInvalidConnection) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return

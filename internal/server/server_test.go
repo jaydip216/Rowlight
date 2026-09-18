@@ -9,7 +9,7 @@ import (
 	"testing"
 	"testing/fstest"
 
-	appstate "github.com/jaydip216/db0/internal/state"
+	appstate "github.com/jaydip216/Rowlight/internal/state"
 )
 
 func TestLocalAPIAuthorization(t *testing.T) {
@@ -51,7 +51,7 @@ func TestLocalAPIAuthorization(t *testing.T) {
 
 func TestRootServesIndexWithoutRedirect(t *testing.T) {
 	t.Parallel()
-	web := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<!doctype html><title>db0</title>")}}
+	web := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<!doctype html><title>Rowlight</title>")}}
 	app := New("secret", fs.FS(web))
 
 	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7777/", nil)
@@ -65,7 +65,7 @@ func TestRootServesIndexWithoutRedirect(t *testing.T) {
 	if location := res.Header().Get("Location"); location != "" {
 		t.Fatalf("unexpected redirect to %q", location)
 	}
-	if got := res.Body.String(); got != "<!doctype html><title>db0</title>" {
+	if got := res.Body.String(); got != "<!doctype html><title>Rowlight</title>" {
 		t.Fatalf("body = %q", got)
 	}
 }
@@ -75,7 +75,7 @@ func TestProfilesAndHistoryAPI(t *testing.T) {
 	web := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ok")}}
 	app := New("secret", fs.FS(web))
 
-	profile := []byte(`{"name":"Local","host":"127.0.0.1","port":3306,"user":"reader","database":"app","tls":{"mode":"disabled"}}`)
+	profile := []byte(`{"name":"Local","host":"127.0.0.1","port":3306,"user":"reader","database":"","tls":{"mode":"disabled"}}`)
 	create := apiRequest(app, http.MethodPost, "/api/profiles", profile)
 	if create.Code != http.StatusOK {
 		t.Fatalf("create profile status = %d: %s", create.Code, create.Body.String())
@@ -89,6 +89,9 @@ func TestProfilesAndHistoryAPI(t *testing.T) {
 	if list.Code != http.StatusOK || !bytes.Contains(list.Body.Bytes(), []byte(`"name":"Local"`)) {
 		t.Fatalf("list profiles status = %d: %s", list.Code, list.Body.String())
 	}
+	if !bytes.Contains(list.Body.Bytes(), []byte(`"database":""`)) {
+		t.Fatalf("list profiles omitted empty database: %s", list.Body.String())
+	}
 
 	if err := app.state.AddHistory(appstate.HistoryEntry{SQL: "SELECT 1"}); err != nil {
 		t.Fatal(err)
@@ -100,6 +103,21 @@ func TestProfilesAndHistoryAPI(t *testing.T) {
 	cleared := apiRequest(app, http.MethodDelete, "/api/history", nil)
 	if cleared.Code != http.StatusNoContent || len(app.state.History()) != 0 {
 		t.Fatalf("clear history status = %d", cleared.Code)
+	}
+}
+
+func TestProfileEngineValidationAndLegacyDefault(t *testing.T) {
+	t.Parallel()
+	web := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ok")}}
+	app := New("secret", fs.FS(web))
+
+	legacy := apiRequest(app, http.MethodPost, "/api/profiles", []byte(`{"name":"Legacy","host":"127.0.0.1","port":3306,"user":"reader","database":"","tls":{"mode":"disabled"}}`))
+	if legacy.Code != http.StatusOK || !bytes.Contains(legacy.Body.Bytes(), []byte(`"engine":"mysql"`)) {
+		t.Fatalf("legacy profile status = %d: %s", legacy.Code, legacy.Body.String())
+	}
+	invalid := apiRequest(app, http.MethodPost, "/api/profiles", []byte(`{"name":"Bad","engine":"oracle","host":"127.0.0.1","port":1521,"user":"reader","database":"","tls":{"mode":"disabled"}}`))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid engine status = %d: %s", invalid.Code, invalid.Body.String())
 	}
 }
 

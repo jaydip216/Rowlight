@@ -1,55 +1,186 @@
-# db0
+# Rowlight
 
-db0 is an early, lightweight, read-only MySQL/MariaDB client. One Go process serves an embedded browser interface on loopback, opens a tab, and owns the database connections.
+A lightweight, read-only SQL client for PostgreSQL, MySQL, and MariaDB. Rowlight runs as a single Go process, opens its interface in your existing browser, and keeps database connections in the local backend.
 
-This repository currently contains the Phase 1–2 vertical slice. It is suitable for local testing, not yet a stable release.
+> **Project status:** Alpha. The core browse-and-query workflow is usable, but packaging and broader compatibility testing are still in progress.
 
-## Current features
+## Why Rowlight?
 
-- Direct MySQL/MariaDB connections, with verified system, custom-CA, or mutual TLS.
-- Persistent nonsecret connection profiles. Passwords and client private keys are never written to the profile file.
-- Lazy database, table, and column browsing.
-- One-click browsing for the first 200 table or view rows.
-- MySQL-aware CodeMirror editor with schema-name completion.
-- One-statement read-only query policy and read-only database transactions.
-- Streaming, bounded results with a virtualized result grid.
-- Copy loaded results as TSV and export them as CSV.
-- Capped query history with session-level disable and clear controls.
-- Query cancellation and automatic cleanup when the browser request closes.
-- Loopback-only HTTP server with a random per-launch bearer token.
+Many database clients bundle administration, modeling, migration, and collaboration features into a large desktop application. Rowlight focuses on a smaller workflow:
 
-The SQL policy is intentionally conservative. v0.1 accepts `SELECT`, `SHOW`, `DESCRIBE`, `DESC`, and `EXPLAIN`, while rejecting multiple statements and potentially mutating constructs. CTEs are deferred. Use a database account with only the permissions you intend to grant: the UI policy is an accident-prevention layer, not an authorization boundary for hostile SQL.
+1. Connect directly to a database.
+2. Browse schemas, tables, views, and columns.
+3. Run read-only SQL.
+4. Inspect, copy, or export bounded results.
 
-## Build and run
+The release binary is currently about 11 MB and the backend measured approximately 13 MiB idle RSS on the development Mac. These are development measurements, not compatibility guarantees across systems.
 
-Requirements for development are Go 1.24+ and Node.js 20+.
+## Features
+
+- PostgreSQL, MySQL, and MariaDB connections
+- System certificate, custom CA, mutual TLS, and explicitly disabled TLS modes
+- Read-only transactions and a conservative, engine-aware SQL policy
+- Persistent nonsecret connection profiles
+- Lazy schema, table, view, and column browsing
+- Server-side table filtering, sorting, and pagination
+- MySQL- and PostgreSQL-aware CodeMirror editor
+- Streaming, bounded query results with a virtualized grid
+- Query cancellation
+- Optional, capped local query history
+- Copy loaded rows as TSV or export them as CSV
+- Exact string transport for large integers and decimals
+- Explicit NULL, binary, and truncated-value representations
+- Loopback-only HTTP server with a random per-launch bearer token
+
+## Quick start
+
+Development builds require:
+
+- Go 1.24 or newer
+- Node.js 20 or newer
+- macOS, Linux, or Windows
 
 ```sh
+git clone https://github.com/jaydip216/Rowlight.git
+cd Rowlight
 make build
-./bin/db0
+./bin/rowlight
 ```
 
-The command listens on a random `127.0.0.1` port and opens the authenticated URL in the default browser. Use `./bin/db0 -no-open` to print the URL without opening it, or `-port 7070` to request a fixed loopback port.
+Rowlight listens on a random `127.0.0.1` port and opens an authenticated URL in the default browser.
 
-End users only need the built `db0` executable. Frontend assets are embedded into it.
+Useful launch options:
+
+```sh
+# Print the URL without opening a browser
+./bin/rowlight -no-open
+
+# Use a fixed loopback port
+./bin/rowlight -port 7070
+```
+
+The frontend is embedded in the executable. End users do not need Node.js after the binary has been built.
+
+## Supported databases
+
+| Engine | Default port | Browse model |
+|---|---:|---|
+| PostgreSQL | 5432 | Schemas inside the connected database |
+| MySQL | 3306 | Databases |
+| MariaDB | 3306 | Databases |
+
+The current integration fixtures cover PostgreSQL 17 and MariaDB. A broader version matrix and certificate-enabled database fixtures are planned.
+
+## Read-only behavior
+
+Rowlight accepts a deliberately narrow SQL subset. It supports `SELECT`, `SHOW`, and `EXPLAIN`; MySQL and MariaDB also support `DESCRIBE` and `DESC`. Multiple statements, writes, locking reads, file output, session control, and other potentially mutating constructs are rejected.
+
+Queries also execute inside database read-only transactions. These checks reduce accidents, but they are not a security boundary for hostile SQL or privileged database functions. Use a database account with only the permissions you intend to grant.
+
+## Security and local data
+
+- The HTTP server binds only to loopback.
+- API calls require a random token generated on each launch.
+- Host and Origin headers are validated.
+- Passwords and client private keys remain in backend memory and are not saved in profiles.
+- TLS never silently downgrades when a verified mode is selected.
+- MySQL multi-statement execution is disabled.
+
+On macOS, nonsecret profiles and query history are stored with owner-only permissions at:
+
+```text
+~/Library/Application Support/Rowlight/state.json
+```
+
+Query text can contain sensitive literals. History can be disabled or cleared from the query toolbar.
 
 ## Development
 
+Run the complete unit suite and production frontend build:
+
 ```sh
 make test
+```
+
+Build the release-style executable:
+
+```sh
+make build
+```
+
+Run the backend on port 7070:
+
+```sh
 make dev-backend
 ```
 
-For Vite hot reload, run `npm run dev` inside `web/` and run the backend on port 7070. The development server proxies `/api` to that port. Open the authenticated backend URL once to obtain the per-launch token; the production build stores it in browser session memory after removing it from the URL fragment.
+For Vite hot reload, run this in another terminal:
 
-## Limits in this build
+```sh
+cd web
+npm install
+npm run dev
+```
 
-- Query previews are capped at 1,000 rows and approximately 8 MiB.
-- Individual cell previews are capped at 1 MiB and marked as truncated in transport.
-- Up to two user queries execute concurrently across the process.
-- Keychain password storage, writable sessions, SSH tunnel management, and additional database engines are deferred.
-- Client cancellation is implemented. Whether a cancelled statement disappears immediately on the server still needs verification against the supported MySQL and MariaDB matrix.
+The Vite development server proxies `/api` to `http://127.0.0.1:7070`.
 
-See [PLAN.md](./PLAN.md) for the implementation roadmap and validation gates.
+### Integration tests
 
-On macOS, profiles and query history are stored with owner-only permissions under `~/Library/Application Support/db0/state.json`. SQL text may contain sensitive literals, so history can be disabled from the query toolbar.
+MySQL or MariaDB:
+
+```sh
+ROWLIGHT_INTEGRATION=1 \
+ROWLIGHT_TEST_HOST=127.0.0.1 \
+ROWLIGHT_TEST_PORT=3306 \
+ROWLIGHT_TEST_USER=reader \
+ROWLIGHT_TEST_PASSWORD=secret \
+ROWLIGHT_TEST_DATABASE=app \
+go test -run TestMariaDBIntegration -v ./internal/store
+```
+
+PostgreSQL:
+
+```sh
+ROWLIGHT_POSTGRES_INTEGRATION=1 \
+ROWLIGHT_POSTGRES_HOST=127.0.0.1 \
+ROWLIGHT_POSTGRES_PORT=5432 \
+ROWLIGHT_POSTGRES_USER=rowlight \
+ROWLIGHT_POSTGRES_PASSWORD=secret \
+ROWLIGHT_POSTGRES_DATABASE=rowlight_test \
+go test -run TestPostgresIntegration -v ./internal/store
+```
+
+The PostgreSQL integration test creates and replaces its fixture table and view in the configured database. Use a disposable test database.
+
+## Architecture
+
+```text
+Browser UI
+    │ authenticated loopback HTTP + streamed NDJSON
+    ▼
+Rowlight Go process
+    ├── connection and query coordinator
+    ├── bounded result encoding
+    ├── local profiles and history
+    └── database/sql
+          ├── pgx
+          └── go-sql-driver/mysql
+```
+
+Frontend assets are compiled by Vite and embedded into the Go executable. The browser never connects directly to the database.
+
+## Current limits
+
+- Query previews stop at 1,000 rows or approximately 8 MiB.
+- Individual cell previews stop at 1 MiB and are marked as truncated.
+- Table browsing uses offset pages of 100 rows by default and caps pages at 200 rows.
+- Unsorted offset pages have database-defined ordering.
+- At most two user queries execute concurrently across the process.
+- CTEs, writable sessions, grid editing, SSH tunnel management, and Keychain storage are not implemented yet.
+- Signing, notarization, release archives, and a broader browser/database test matrix are still pending.
+
+See [PLAN.md](./PLAN.md) for the roadmap and validation goals. API and frontend development notes are in [web/README.md](./web/README.md).
+
+## Contributing
+
+Issues and focused pull requests are welcome. Please run `make test` before submitting changes and include a real-database integration test when changing engine-specific connection, metadata, or query behavior.

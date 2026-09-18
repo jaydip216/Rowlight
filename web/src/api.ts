@@ -14,8 +14,8 @@ import type {
 const launchToken = (() => {
   const hash = new URLSearchParams(location.hash.replace(/^#/, ""));
   const tokenFromHash = hash.get("token");
-  if (tokenFromHash) sessionStorage.setItem("db0-launch-token", tokenFromHash);
-  const token = tokenFromHash ?? sessionStorage.getItem("db0-launch-token") ?? "";
+  if (tokenFromHash) sessionStorage.setItem("rowlight-launch-token", tokenFromHash);
+  const token = tokenFromHash ?? sessionStorage.getItem("rowlight-launch-token") ?? "";
   if (tokenFromHash) history.replaceState(null, document.title, `${location.pathname}${location.search}`);
   return token;
 })();
@@ -131,7 +131,7 @@ export const api = {
     if (!response.ok) throw await responseError(response);
     if (!response.body) throw new ApiError("The server returned an empty query stream.", 502);
 
-    const queryId = response.headers.get("X-DB0-Query-ID") ?? undefined;
+    const queryId = response.headers.get("X-Rowlight-Query-ID") ?? undefined;
     const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
     let buffered = "";
     while (true) {

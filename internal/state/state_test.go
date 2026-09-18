@@ -18,8 +18,8 @@ func TestProfileRoundTripAndUpdate(t *testing.T) {
 	}
 
 	saved, err := store.SaveProfile(Profile{
-		Name: "Local MariaDB", Host: "127.0.0.1", Port: 3307,
-		User: "reader", Database: "db0_test",
+		Name: "Local MariaDB", Engine: "mysql", Host: "127.0.0.1", Port: 3307,
+		User: "reader", Database: "rowlight_test",
 		TLS: TLSProfile{Mode: "custom", ServerName: "db.local", CAPEM: "ca", ClientCertPEM: "cert"},
 	})
 	if err != nil {
@@ -45,7 +45,7 @@ func TestProfileRoundTripAndUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	profiles := reopened.Profiles()
-	if len(profiles) != 1 || profiles[0].Name != "Updated" {
+	if len(profiles) != 1 || profiles[0].Name != "Updated" || profiles[0].Engine != "mysql" {
 		t.Fatalf("profiles = %+v", profiles)
 	}
 	profiles[0].Name = "mutated copy"
@@ -152,6 +152,23 @@ func TestOpenSortsHistoryNewestFirst(t *testing.T) {
 	}
 }
 
+func TestLegacyProfileDefaultsToMySQL(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "state.json")
+	b := []byte(`{"profiles":[{"id":"legacy","name":"Old profile","host":"127.0.0.1","port":3306,"user":"reader","database":"","tls":{"mode":"disabled"}}],"history":[]}`)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles := store.Profiles()
+	if len(profiles) != 1 || profiles[0].Engine != "mysql" {
+		t.Fatalf("legacy profiles = %+v", profiles)
+	}
+}
+
 func TestMemoryStore(t *testing.T) {
 	t.Parallel()
 	store := NewMemory()
@@ -163,6 +180,9 @@ func TestMemoryStore(t *testing.T) {
 	}
 	if len(store.Profiles()) != 1 || len(store.History()) != 1 {
 		t.Fatal("memory store did not retain state")
+	}
+	if store.Profiles()[0].Engine != "mysql" {
+		t.Fatal("profile without engine did not default to mysql")
 	}
 }
 
