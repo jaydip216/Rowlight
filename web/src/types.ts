@@ -1,0 +1,75 @@
+export type TLSMode = "disabled" | "system" | "custom" | "mutual";
+
+export interface ConnectionInput {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  database: string;
+  tls: {
+    mode: TLSMode;
+    serverName?: string;
+    caPem?: string;
+    clientCertPem?: string;
+    clientKeyPem?: string;
+  };
+}
+
+export interface Connection {
+  id: string;
+  serverVersion: string;
+  database: string;
+}
+
+export interface ConnectionProfile {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  database: string;
+  tls: {
+    mode: TLSMode;
+    serverName?: string;
+    caPem?: string;
+    clientCertPem?: string;
+  };
+  updatedAt: string;
+}
+
+export interface QueryHistoryEntry {
+  id: string;
+  sql: string;
+  database: string;
+  server: string;
+  executedAt: string;
+  elapsedMs: number;
+  rowCount: number;
+  truncated: boolean;
+  error?: string;
+}
+
+export interface DatabaseItem { name: string }
+export interface TableItem { name: string; type: "table" | "view" }
+export interface ColumnItem { name: string; dataType: string; nullable: boolean; key?: string }
+
+export interface ResultColumn {
+  name: string;
+  databaseType: string;
+}
+
+export interface EncodedCell {
+  encoding: "base64" | "utf8";
+  data: string;
+  truncated: boolean;
+}
+
+export type CellValue = string | null | EncodedCell;
+
+export type QueryEvent =
+  | { type: "started"; queryId: string }
+  | { type: "meta"; queryId: string; columns: ResultColumn[] }
+  | { type: "rows"; rows: CellValue[][] }
+  | { type: "complete"; rowCount: number; elapsedMs: number; truncated: boolean }
+  | { type: "cancelled"; rowCount: number; elapsedMs: number }
+  | { type: "error"; error: string };
