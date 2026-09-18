@@ -2,7 +2,7 @@ import "./styles.css";
 import { api } from "./api";
 import { createEditor, selectedQuery, setQuery } from "./editor";
 import { ResultGrid } from "./grid";
-import type { ColumnItem, Connection, ConnectionInput, ConnectionProfile, QueryEvent, QueryHistoryEntry, TableItem, TLSMode } from "./types";
+import type { BrowseFilterOperator, BrowseRequest, ColumnItem, Connection, ConnectionInput, ConnectionProfile, QueryEvent, QueryHistoryEntry, TableItem, TLSMode } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
@@ -59,7 +59,7 @@ app.innerHTML = `
       </aside>
       <section class="workbench">
         <div class="query-toolbar">
-          <div class="toolbar-context"><span><strong id="active-database">No database selected</strong><span class="readonly-pill">READ ONLY</span></span><select id="query-history" class="history-select" aria-label="Recent queries"><option value="">Recent queries</option></select><button id="clear-history" class="history-clear" title="Clear query history">Clear</button></div>
+          <div class="toolbar-context"><span><strong id="active-database">No database selected</strong><span class="readonly-pill">READ ONLY</span></span><select id="query-history" class="history-select" aria-label="Recent queries"><option value="">Recent queries</option></select><label class="history-toggle"><input id="record-history" type="checkbox" checked>History</label><button id="clear-history" class="history-clear" title="Clear query history">Clear</button></div>
           <div class="toolbar-actions">
             <span class="shortcut">⌘↵</span>
             <button id="cancel-query" class="button danger hidden">Cancel</button>
@@ -67,6 +67,18 @@ app.innerHTML = `
           </div>
         </div>
         <div id="editor" class="editor"></div>
+        <div id="table-controls" class="table-controls hidden">
+          <strong id="browse-label"></strong>
+          <select id="filter-column" aria-label="Filter column"><option value="">Filter column</option></select>
+          <select id="filter-operator" aria-label="Filter operator">
+            <option value="contains">contains</option><option value="equals">equals</option><option value="startsWith">starts with</option><option value="isNull">is NULL</option><option value="isNotNull">is not NULL</option>
+          </select>
+          <input id="filter-value" placeholder="Value" aria-label="Filter value">
+          <select id="sort-column" aria-label="Sort column"><option value="">No sorting</option></select>
+          <select id="sort-direction" aria-label="Sort direction"><option value="asc">Ascending</option><option value="desc">Descending</option></select>
+          <button id="apply-browse" class="button secondary">Apply</button>
+          <span class="browse-pager"><button id="previous-page" class="icon-button" title="Previous page">←</button><span id="page-label">Page 1</span><button id="next-page" class="icon-button" title="Next page">→</button></span>
+        </div>
         <div class="result-bar">
           <div class="result-tabs"><button class="result-tab active">Results</button></div>
           <div class="result-meta">
@@ -97,6 +109,14 @@ const exportResultsButton = $("#export-results") as HTMLButtonElement;
 const profileSelect = $("#saved-profile") as HTMLSelectElement;
 const deleteProfileButton = $("#delete-profile") as HTMLButtonElement;
 const historySelect = $("#query-history") as HTMLSelectElement;
+const tableControls = $("#table-controls");
+const filterColumn = $("#filter-column") as HTMLSelectElement;
+const filterOperator = $("#filter-operator") as HTMLSelectElement;
+const filterValue = $("#filter-value") as HTMLInputElement;
+const sortColumn = $("#sort-column") as HTMLSelectElement;
+const sortDirection = $("#sort-direction") as HTMLSelectElement;
+const previousPageButton = $("#previous-page") as HTMLButtonElement;
+const nextPageButton = $("#next-page") as HTMLButtonElement;
 const grid = new ResultGrid($("#results"));
 
 let connection: Connection | null = null;
@@ -108,6 +128,10 @@ const tableCache = new Map<string, TableItem[]>();
 const columnCache = new Map<string, ColumnItem[]>();
 let profiles: ConnectionProfile[] = [];
 let historyEntries: QueryHistoryEntry[] = [];
+const activeConnectionKey = "db0-active-connection";
+type BrowseState = { schema: string; table: string; offset: number; pageSize: number; hasMore: boolean };
+let browseState: BrowseState | null = null;
+let browseLoading = false;
 
 const editor = createEditor($("#editor"), () => void runQuery(), () => [...schemaNames]);
 
@@ -139,7 +163,7 @@ function applyProfile(profile: ConnectionProfile): void {
   setFormValue("port", String(profile.port));
   setFormValue("user", profile.user);
   setFormValue("password", "");
-  setFormValue("database", profile.database);
+  setFormValue("database", profile.database ?? "");
   setFormValue("tlsMode", profile.tls.mode);
   setFormValue("serverName", profile.tls.serverName ?? "");
   setFormValue("caPem", profile.tls.caPem ?? "");
@@ -206,6 +230,7 @@ async function connect(): Promise<void> {
   try {
     const input = connectionInput();
     connection = await api.connect(input);
+    sessionStorage.setItem(activeConnectionKey, JSON.stringify(connection));
     try { await saveSelectedProfile(input); }
     catch (error) { showError(connectionError, error); }
     activeDatabase = connection.database;
@@ -219,6 +244,29 @@ async function connect(): Promise<void> {
     await loadHistory();
   } catch (error) { showError(connectionError, error); }
   finally { setBusy(button, false, ""); }
+}
+
+async function restoreConnection(): Promise<boolean> {
+  const saved = sessionStorage.getItem(activeConnectionKey);
+  if (!saved) return false;
+  try {
+    const remembered = JSON.parse(saved) as Connection;
+    connection = await api.connection(remembered.id);
+    sessionStorage.setItem(activeConnectionKey, JSON.stringify(connection));
+    activeDatabase = connection.database;
+    $("#connection-label").textContent = `${connection.serverVersion} · read only`;
+    $(".status-dot").classList.add("online");
+    $("#disconnect").classList.remove("hidden");
+    connectView.classList.add("hidden");
+    workspace.classList.remove("hidden");
+    updateActiveDatabase();
+    await Promise.all([loadDatabases(), loadHistory()]);
+    return true;
+  } catch {
+    sessionStorage.removeItem(activeConnectionKey);
+    connection = null;
+    return false;
+  }
 }
 
 async function loadDatabases(): Promise<void> {
@@ -267,16 +315,28 @@ function tableNode(database: string, table: TableItem): HTMLElement {
   const details = document.createElement("details");
   details.className = "tree-table"; details.dataset.search = `${database} ${table.name}`.toLowerCase();
   const summary = document.createElement("summary");
-  summary.innerHTML = `<span class="table-icon">▦</span><span></span><small></small><button type="button" class="tree-browse" title="Browse the first 200 rows">Browse</button>`;
+  summary.innerHTML = `<span class="table-icon">▦</span><span class="tree-table-name" title="Click to browse rows"></span><small></small><button type="button" class="tree-browse" title="Browse the first 200 rows">Browse</button>`;
   summary.children[1]!.textContent = table.name; summary.children[2]!.textContent = table.type;
+  const browseTable = () => {
+    activeDatabase = database;
+    updateActiveDatabase();
+    setQuery(editor, `SELECT *\nFROM ${quoteIdentifier(database)}.${quoteIdentifier(table.name)}\nLIMIT 200;`);
+    void startBrowse(database, table.name);
+  };
+  summary.querySelector<HTMLElement>(".tree-table-name")!.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    browseTable();
+  });
+  summary.addEventListener("dblclick", (event) => {
+    event.preventDefault();
+    browseTable();
+  });
   const browse = summary.querySelector<HTMLButtonElement>(".tree-browse")!;
   browse.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
-    activeDatabase = database;
-    updateActiveDatabase();
-    setQuery(editor, `SELECT *\nFROM ${quoteIdentifier(database)}.${quoteIdentifier(table.name)}\nLIMIT 200;`);
-    void runQuery();
+    browseTable();
   });
   details.append(summary);
   details.addEventListener("toggle", () => { if (details.open) void loadColumns(details, database, table.name); });
@@ -310,10 +370,74 @@ function quoteIdentifier(value: string): string {
   return `\`${value.replaceAll("`", "``")}\``;
 }
 
+async function startBrowse(schema: string, table: string): Promise<void> {
+  browseState = { schema, table, offset: 0, pageSize: 100, hasMore: false };
+  filterColumn.value = "";
+  filterOperator.value = "contains";
+  filterValue.value = "";
+  sortColumn.value = "";
+  sortDirection.value = "asc";
+  tableControls.classList.remove("hidden");
+  $("#browse-label").textContent = `${schema}.${table}`;
+  await loadBrowsePage();
+}
+
+async function loadBrowsePage(): Promise<void> {
+  if (!connection || !browseState || browseLoading) return;
+  browseLoading = true;
+  queryError.classList.add("hidden");
+  grid.reset();
+  updateResultActions();
+  status.textContent = "Loading table page…";
+  const request: BrowseRequest = {
+    schema: browseState.schema,
+    table: browseState.table,
+    offset: browseState.offset,
+    pageSize: browseState.pageSize,
+  };
+  if (sortColumn.value) request.sort = { column: sortColumn.value, direction: sortDirection.value as "asc" | "desc" };
+  if (filterColumn.value) {
+    const operator = filterOperator.value as BrowseFilterOperator;
+    request.filters = [{ column: filterColumn.value, operator }];
+    if (operator !== "isNull" && operator !== "isNotNull") request.filters[0]!.value = filterValue.value;
+  }
+  try {
+    const result = await api.browse(connection.id, request);
+    if (!browseState) return;
+    browseState.offset = result.offset;
+    browseState.pageSize = result.pageSize;
+    browseState.hasMore = result.hasMore;
+    grid.reset(result.columns);
+    grid.append(result.rows);
+    populateBrowseColumns(result.columns.map((column) => column.name));
+    const page = Math.floor(result.offset / result.pageSize) + 1;
+    $("#page-label").textContent = `Page ${page}`;
+    previousPageButton.disabled = result.offset === 0;
+    nextPageButton.disabled = !result.hasMore;
+    status.textContent = `${result.rows.length.toLocaleString()} rows · page ${page}`;
+    updateResultActions();
+  } catch (error) {
+    showError(queryError, error);
+    status.textContent = "Table browse failed";
+  } finally {
+    browseLoading = false;
+  }
+}
+
+function populateBrowseColumns(columns: string[]): void {
+  const selectedFilter = filterColumn.value;
+  const selectedSort = sortColumn.value;
+  filterColumn.replaceChildren(new Option("Filter column", ""), ...columns.map((name) => new Option(name, name)));
+  sortColumn.replaceChildren(new Option("No sorting", ""), ...columns.map((name) => new Option(name, name)));
+  if (columns.includes(selectedFilter)) filterColumn.value = selectedFilter;
+  if (columns.includes(selectedSort)) sortColumn.value = selectedSort;
+}
+
 async function runQuery(): Promise<void> {
   if (!connection || queryController) return;
   const sql = selectedQuery(editor);
   if (!sql) { showError(queryError, new Error("Enter a query to run.")); return; }
+  browseState = null; tableControls.classList.add("hidden");
   queryError.classList.add("hidden"); grid.reset(); updateResultActions();
   queryController = new AbortController(); queryId = undefined;
   runButton.classList.add("hidden"); cancelButton.classList.remove("hidden"); status.textContent = "Running…";
@@ -322,12 +446,12 @@ async function runQuery(): Promise<void> {
     if (event.type === "started") queryId = event.queryId;
     if (event.type === "meta") { queryId = event.queryId; grid.setColumns(event.columns); }
     if (event.type === "rows") { grid.append(event.rows); updateResultActions(); }
-    if (event.type === "complete") { status.textContent = `${event.rowCount.toLocaleString()} rows · ${event.elapsedMs} ms${event.truncated ? " · LIMIT REACHED" : ""}`; window.setTimeout(() => void loadHistory(), 0); }
+    if (event.type === "complete") status.textContent = `${event.rowCount.toLocaleString()} rows · ${event.elapsedMs} ms${event.truncated ? " · LIMIT REACHED" : ""}`;
     if (event.type === "cancelled") status.textContent = `Cancelled · ${event.rowCount.toLocaleString()} rows · ${event.elapsedMs} ms`;
     if (event.type === "error") { showError(queryError, new Error(event.error)); status.textContent = "Query failed"; }
   };
   try {
-    const headerQueryId = await api.query(connection.id, sql, queryController.signal, onEvent);
+    const headerQueryId = await api.query(connection.id, sql, ($("#record-history") as HTMLInputElement).checked, queryController.signal, onEvent);
     queryId ??= headerQueryId;
     if (status.textContent === "Running…") status.textContent = `${grid.rowCount.toLocaleString()} rows · ${Math.round(performance.now() - started)} ms`;
   } catch (error) {
@@ -335,6 +459,7 @@ async function runQuery(): Promise<void> {
   } finally {
     queryController = undefined; queryId = undefined;
     runButton.classList.remove("hidden"); cancelButton.classList.add("hidden");
+    await loadHistory().catch(() => undefined);
   }
 }
 
@@ -400,6 +525,8 @@ $("select[name=tlsMode]").addEventListener("change", (event) => {
 $("#disconnect").addEventListener("click", async () => {
   if (connection) await api.disconnect(connection.id).catch(() => undefined);
   connection = null; tableCache.clear(); columnCache.clear(); schemaNames.clear();
+  browseState = null; tableControls.classList.add("hidden");
+  sessionStorage.removeItem(activeConnectionKey);
   workspace.classList.add("hidden"); connectView.classList.remove("hidden"); $("#disconnect").classList.add("hidden");
   $("#connection-label").textContent = "Not connected"; $(".status-dot").classList.remove("online");
 });
@@ -412,6 +539,31 @@ runButton.addEventListener("click", () => void runQuery());
 cancelButton.addEventListener("click", () => void cancelQuery());
 copyResultsButton.addEventListener("click", () => void copyResults());
 exportResultsButton.addEventListener("click", exportResults);
+$("#apply-browse").addEventListener("click", () => {
+  if (!browseState) return;
+  browseState.offset = 0;
+  void loadBrowsePage();
+});
+previousPageButton.addEventListener("click", () => {
+  if (!browseState || browseState.offset === 0) return;
+  browseState.offset = Math.max(0, browseState.offset - browseState.pageSize);
+  void loadBrowsePage();
+});
+nextPageButton.addEventListener("click", () => {
+  if (!browseState?.hasMore) return;
+  browseState.offset += browseState.pageSize;
+  void loadBrowsePage();
+});
+filterOperator.addEventListener("change", () => {
+  filterValue.disabled = filterOperator.value === "isNull" || filterOperator.value === "isNotNull";
+});
+filterValue.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    if (browseState) browseState.offset = 0;
+    void loadBrowsePage();
+  }
+});
 historySelect.addEventListener("change", () => {
   const entry = historyEntries.find((item) => item.id === historySelect.value);
   if (entry) setQuery(editor, entry.sql);
@@ -422,4 +574,7 @@ $("#clear-history").addEventListener("click", async () => {
   catch (error) { showError(queryError, error); }
 });
 
-void loadProfiles().catch((error) => showError(connectionError, error));
+void Promise.all([
+  loadProfiles().catch((error) => showError(connectionError, error)),
+  restoreConnection(),
+]);

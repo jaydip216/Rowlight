@@ -49,6 +49,25 @@ export interface QueryHistoryEntry {
   error?: string;
 }
 
+export type BrowseFilterOperator = "equals" | "contains" | "startsWith" | "isNull" | "isNotNull";
+
+export interface BrowseRequest {
+  schema: string;
+  table: string;
+  offset: number;
+  pageSize: number;
+  sort?: { column: string; direction: "asc" | "desc" };
+  filters?: Array<{ column: string; operator: BrowseFilterOperator; value?: string }>;
+}
+
+export interface BrowseResult {
+  columns: ResultColumn[];
+  rows: CellValue[][];
+  offset: number;
+  pageSize: number;
+  hasMore: boolean;
+}
+
 export interface DatabaseItem { name: string }
 export interface TableItem { name: string; type: "table" | "view" }
 export interface ColumnItem { name: string; dataType: string; nullable: boolean; key?: string }

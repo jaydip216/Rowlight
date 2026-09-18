@@ -14,11 +14,13 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
 
 	"github.com/jaydip216/db0/internal/server"
+	appstate "github.com/jaydip216/db0/internal/state"
 )
 
 //go:embed web/dist
@@ -42,7 +44,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	app := server.New(token, dist)
+	persistent := openState()
+	app := server.NewWithState(token, dist, persistent)
 	defer app.Close()
 	url := fmt.Sprintf("http://%s/#token=%s", ln.Addr().String(), token)
 	fmt.Printf("db0 listening at %s\n", url)
@@ -63,6 +66,20 @@ func main() {
 	if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+}
+
+func openState() *appstate.Store {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		log.Printf("persistent profiles and history disabled: %v", err)
+		return appstate.NewMemory()
+	}
+	persistent, err := appstate.Open(filepath.Join(configDir, "db0", "state.json"))
+	if err != nil {
+		log.Printf("persistent profiles and history disabled: %v", err)
+		return appstate.NewMemory()
+	}
+	return persistent
 }
 
 func randomToken() (string, error) {

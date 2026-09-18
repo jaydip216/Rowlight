@@ -12,24 +12,40 @@ import (
 	"strings"
 	"time"
 
+	appstate "github.com/jaydip216/db0/internal/state"
 	"github.com/jaydip216/db0/internal/store"
 )
 
 type Server struct {
 	token   string
 	store   *store.Store
+	state   *appstate.Store
 	handler http.Handler
 }
 
 func New(token string, web fs.FS) *Server {
-	s := &Server{token: token, store: store.New()}
+	return NewWithState(token, web, appstate.NewMemory())
+}
+
+func NewWithState(token string, web fs.FS, persistent *appstate.Store) *Server {
+	if persistent == nil {
+		persistent = appstate.NewMemory()
+	}
+	s := &Server{token: token, store: store.New(), state: persistent}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.health)
+	mux.HandleFunc("GET /api/profiles", s.profiles)
+	mux.HandleFunc("POST /api/profiles", s.saveProfile)
+	mux.HandleFunc("DELETE /api/profiles/{id}", s.deleteProfile)
+	mux.HandleFunc("GET /api/history", s.history)
+	mux.HandleFunc("DELETE /api/history", s.clearHistory)
 	mux.HandleFunc("POST /api/connections", s.createConnection)
+	mux.HandleFunc("GET /api/connections/{id}", s.connection)
 	mux.HandleFunc("DELETE /api/connections/{id}", s.deleteConnection)
 	mux.HandleFunc("GET /api/connections/{id}/schemas", s.schemas)
 	mux.HandleFunc("GET /api/connections/{id}/schemas/{schema}/tables", s.tables)
 	mux.HandleFunc("GET /api/connections/{id}/schemas/{schema}/tables/{table}/columns", s.columns)
+	mux.HandleFunc("POST /api/connections/{id}/browse", s.browse)
 	mux.HandleFunc("POST /api/connections/{id}/queries", s.query)
 	mux.HandleFunc("DELETE /api/queries/{id}", s.cancelQuery)
 	mux.Handle("/", spaHandler(web))
@@ -100,6 +116,60 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) profiles(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"profiles": s.state.Profiles()})
+}
+
+func (s *Server) saveProfile(w http.ResponseWriter, r *http.Request) {
+	var profile appstate.Profile
+	if err := decodeJSON(w, r, &profile); err != nil {
+		return
+	}
+	profile.Name = strings.TrimSpace(profile.Name)
+	profile.Host = strings.TrimSpace(profile.Host)
+	profile.User = strings.TrimSpace(profile.User)
+	profile.CreatedAt = time.Time{}
+	profile.UpdatedAt = time.Time{}
+	if profile.Name == "" || profile.Host == "" || profile.User == "" {
+		writeError(w, http.StatusBadRequest, "profile name, host, and user are required")
+		return
+	}
+	if profile.Port < 1 || profile.Port > 65535 {
+		writeError(w, http.StatusBadRequest, "profile port must be between 1 and 65535")
+		return
+	}
+	if profile.TLS.Mode != "disabled" && profile.TLS.Mode != "system" && profile.TLS.Mode != "custom" && profile.TLS.Mode != "mutual" {
+		writeError(w, http.StatusBadRequest, "invalid profile TLS mode")
+		return
+	}
+	saved, err := s.state.SaveProfile(profile)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, saved)
+}
+
+func (s *Server) deleteProfile(w http.ResponseWriter, r *http.Request) {
+	if !s.state.DeleteProfile(r.PathValue("id")) {
+		writeError(w, http.StatusNotFound, "profile not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) history(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"history": s.state.History()})
+}
+
+func (s *Server) clearHistory(w http.ResponseWriter, _ *http.Request) {
+	if err := s.state.ClearHistory(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) createConnection(w http.ResponseWriter, r *http.Request) {
 	var req store.ConnectionRequest
 	if err := decodeJSON(w, r, &req); err != nil {
@@ -113,6 +183,17 @@ func (s *Server) createConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, c)
+}
+
+func (s *Server) connection(w http.ResponseWriter, r *http.Request) {
+	info, err := s.store.Info(r.PathValue("id"))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id": r.PathValue("id"), "serverVersion": info.ServerVersion, "database": info.Database,
+	})
 }
 
 func (s *Server) deleteConnection(w http.ResponseWriter, r *http.Request) {
@@ -156,6 +237,21 @@ func (s *Server) columns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"columns": items})
 }
 
+func (s *Server) browse(w http.ResponseWriter, r *http.Request) {
+	var req store.BrowseRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 30*time.Second)
+	defer cancel()
+	result, err := s.store.Browse(ctx, r.PathValue("id"), req)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 	var req store.QueryRequest
 	if err := decodeJSON(w, r, &req); err != nil {
@@ -169,15 +265,46 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	enc := json.NewEncoder(w)
+	var rowCount int64
+	var elapsedMS int64
+	var truncated bool
 	write := func(v any) error {
+		if event, ok := v.(map[string]any); ok && event["type"] == "complete" {
+			rowCount = numberAsInt64(event["rowCount"])
+			elapsedMS = numberAsInt64(event["elapsedMs"])
+			truncated, _ = event["truncated"].(bool)
+		}
 		if err := enc.Encode(v); err != nil {
 			return err
 		}
 		flusher.Flush()
 		return nil
 	}
-	if err := s.store.StreamQuery(r.Context(), r.PathValue("id"), req, write); err != nil {
+	info, _ := s.store.Info(r.PathValue("id"))
+	executedAt := time.Now().UTC()
+	err := s.store.StreamQuery(r.Context(), r.PathValue("id"), req, write)
+	history := appstate.HistoryEntry{SQL: req.SQL, Database: info.Database, Server: info.ServerVersion, ExecutedAt: executedAt, ElapsedMS: elapsedMS, RowCount: rowCount, Truncated: truncated}
+	if err != nil {
+		history.Error = err.Error()
 		_ = write(map[string]any{"type": "error", "error": err.Error()})
+	}
+	if req.RecordHistory == nil || *req.RecordHistory {
+		if saveErr := s.state.AddHistory(history); saveErr != nil {
+			log.Printf("save query history: %v", saveErr)
+		}
+	}
+}
+
+func numberAsInt64(value any) int64 {
+	switch n := value.(type) {
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case float64:
+		return int64(n)
+	default:
+		return 0
 	}
 }
 
@@ -238,6 +365,14 @@ func writeError(w http.ResponseWriter, status int, message string) {
 func writeStoreError(w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrBrowseNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrInvalidBrowse) {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeError(w, http.StatusBadGateway, err.Error())

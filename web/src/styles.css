@@ -65,16 +65,19 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, monospac
 .tree-database > summary { font-weight: 650; }
 .tree-table { margin-left: 14px; }
 .tree-table small, .tree-column small { color: #667587; font-size: 9px; text-transform: uppercase; }
-.tree-browse { margin: 0 4px 0 7px; padding: 2px 5px; visibility: hidden; color: var(--accent); border: 1px solid #285c4d; border-radius: 3px; background: #10231e; cursor: pointer; font-size: 9px; }
-.tree-table > summary:hover .tree-browse, .tree-browse:focus { visibility: visible; }
+.tree-table-name { cursor: pointer; }
+.tree-table-name:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.tree-browse { margin: 0 4px 0 7px; padding: 2px 5px; color: var(--accent); border: 1px solid #285c4d; border-radius: 3px; background: #10231e; cursor: pointer; font-size: 9px; }
 .tree-column { height: 27px; margin-left: 30px; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; color: #a8b4c1; }
 .tree-loading, .tree-error { padding: 9px 12px 9px 30px; color: var(--muted); font-size: 11px; }
 .tree-error { color: #ff9fa4; }
 .filtered { display: none; }
-.workbench { min-width: 0; height: 100%; display: grid; grid-template-rows: 42px minmax(150px, 38%) 37px auto minmax(120px, 1fr); background: var(--surface); }
+.workbench { min-width: 0; height: 100%; display: grid; grid-template-rows: 42px minmax(150px, 38%) auto 37px auto minmax(120px, 1fr); background: var(--surface); }
 .query-toolbar { padding: 0 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); font-size: 12px; }
 .toolbar-context { min-width: 0; display: flex; align-items: center; gap: 9px; }
 .history-select { width: min(280px, 25vw); padding: 5px 8px; font-size: 10px; }
+.history-toggle { display: flex; flex-direction: row; align-items: center; gap: 4px; color: var(--muted); font-size: 9px; font-weight: 500; }
+.history-toggle input { width: auto; }
 .history-clear { padding: 3px 5px; color: var(--muted); border: 0; background: transparent; cursor: pointer; font-size: 9px; }
 .history-clear:hover { color: var(--danger); }
 .readonly-pill { margin-left: 9px; padding: 3px 6px; color: var(--accent); border: 1px solid #285c4d; border-radius: 4px; font-size: 8px; font-weight: 800; letter-spacing: .08em; }
@@ -84,6 +87,12 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, monospac
 .editor .cm-editor { height: 100%; background: #10161e; }
 .editor .cm-scroller { overflow: auto; font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .editor .cm-gutters { background: #10161e; border-right-color: #202b37; }
+.table-controls { min-width: 0; padding: 6px 8px; display: flex; align-items: center; gap: 6px; overflow-x: auto; border-bottom: 1px solid var(--border); background: #0e151d; }
+.table-controls > strong { flex: 0 0 auto; margin-right: 4px; color: var(--accent); font: 10px ui-monospace, monospace; }
+.table-controls select, .table-controls input { width: auto; min-width: 105px; padding: 5px 7px; font-size: 10px; }
+.table-controls #filter-value { min-width: 140px; }
+.browse-pager { margin-left: auto; display: flex; align-items: center; gap: 4px; color: var(--muted); white-space: nowrap; font-size: 10px; }
+.browse-pager .icon-button:disabled { opacity: .35; cursor: default; }
 .result-bar { padding: 0 12px 0 5px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); }
 .result-tab { height: 37px; padding: 0 11px; color: var(--muted); border: 0; border-bottom: 2px solid transparent; background: transparent; font-size: 11px; }
 .result-tab.active { color: #dce4ec; border-bottom-color: var(--accent); }

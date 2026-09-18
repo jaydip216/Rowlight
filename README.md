@@ -7,12 +7,14 @@ This repository currently contains the Phase 1–2 vertical slice. It is suitabl
 ## Current features
 
 - Direct MySQL/MariaDB connections, with verified system, custom-CA, or mutual TLS.
+- Persistent nonsecret connection profiles. Passwords and client private keys are never written to the profile file.
 - Lazy database, table, and column browsing.
 - One-click browsing for the first 200 table or view rows.
 - MySQL-aware CodeMirror editor with schema-name completion.
 - One-statement read-only query policy and read-only database transactions.
 - Streaming, bounded results with a virtualized result grid.
 - Copy loaded results as TSV and export them as CSV.
+- Capped query history with session-level disable and clear controls.
 - Query cancellation and automatic cleanup when the browser request closes.
 - Loopback-only HTTP server with a random per-launch bearer token.
 
@@ -45,7 +47,9 @@ For Vite hot reload, run `npm run dev` inside `web/` and run the backend on port
 - Query previews are capped at 1,000 rows and approximately 8 MiB.
 - Individual cell previews are capped at 1 MiB and marked as truncated in transport.
 - Up to two user queries execute concurrently across the process.
-- Saved profiles, Keychain storage, writable sessions, SSH tunnel management, and additional database engines are deferred.
+- Keychain password storage, writable sessions, SSH tunnel management, and additional database engines are deferred.
 - Client cancellation is implemented. Whether a cancelled statement disappears immediately on the server still needs verification against the supported MySQL and MariaDB matrix.
 
 See [PLAN.md](./PLAN.md) for the implementation roadmap and validation gates.
+
+On macOS, profiles and query history are stored with owner-only permissions under `~/Library/Application Support/db0/state.json`. SQL text may contain sensitive literals, so history can be disabled from the query toolbar.

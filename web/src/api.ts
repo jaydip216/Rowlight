@@ -1,5 +1,7 @@
 import type {
   ColumnItem,
+  BrowseRequest,
+  BrowseResult,
   Connection,
   ConnectionInput,
   ConnectionProfile,
@@ -75,6 +77,10 @@ export const api = {
     return request("/api/history", { method: "DELETE" });
   },
 
+  browse(connectionId: string, input: BrowseRequest): Promise<BrowseResult> {
+    return request(`/api/connections/${segment(connectionId)}/browse`, { method: "POST", body: JSON.stringify(input) });
+  },
+
   async testConnection(input: ConnectionInput): Promise<{ serverVersion: string }> {
     const connection = await request<Connection>("/api/connections", { method: "POST", body: JSON.stringify(input) });
     try { return { serverVersion: connection.serverVersion }; }
@@ -83,6 +89,10 @@ export const api = {
 
   connect(input: ConnectionInput): Promise<Connection> {
     return request("/api/connections", { method: "POST", body: JSON.stringify(input) });
+  },
+
+  connection(id: string): Promise<Connection> {
+    return request(`/api/connections/${segment(id)}`);
   },
 
   disconnect(id: string): Promise<void> {
@@ -108,13 +118,14 @@ export const api = {
   async query(
     connectionId: string,
     sql: string,
+    recordHistory: boolean,
     signal: AbortSignal,
     onEvent: (event: QueryEvent) => void,
   ): Promise<string | undefined> {
     const response = await fetch(`/api/connections/${segment(connectionId)}/queries`, {
       method: "POST",
       headers: apiHeaders({ Accept: "application/x-ndjson" }),
-      body: JSON.stringify({ sql }),
+      body: JSON.stringify({ sql, recordHistory }),
       signal,
     });
     if (!response.ok) throw await responseError(response);

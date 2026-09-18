@@ -74,6 +74,9 @@ func TestStateNeverContainsConnectionSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoded := string(profileType)
+	if !strings.Contains(encoded, `"database":""`) {
+		t.Fatalf("profile JSON omitted empty database: %s", encoded)
+	}
 	for _, forbidden := range []string{"password", "clientKey", "privateKey"} {
 		if strings.Contains(strings.ToLower(encoded), strings.ToLower(forbidden)) {
 			t.Fatalf("profile JSON contains forbidden field %q: %s", forbidden, encoded)
@@ -122,6 +125,30 @@ func TestHistoryNewestFirstCappedAndClearable(t *testing.T) {
 	}
 	if len(reopened.History()) != 0 {
 		t.Fatal("history was not cleared")
+	}
+}
+
+func TestOpenSortsHistoryNewestFirst(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "state.json")
+	older := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Minute)
+	b, err := json.Marshal(diskState{History: []HistoryEntry{
+		{ID: "old", SQL: "SELECT 1", ExecutedAt: older},
+		{ID: "new", SQL: "SELECT 2", ExecutedAt: newer},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history := store.History(); len(history) != 2 || history[0].ID != "new" {
+		t.Fatalf("history = %+v", history)
 	}
 }
 

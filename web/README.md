@@ -24,6 +24,14 @@ All endpoints return JSON errors as `{ "error": "…" }` (the frontend also acce
 
 The Test connection action uses the same create endpoint and immediately deletes the returned connection, so the backend needs no separate test route.
 
+### Profiles and history
+
+- `GET /api/profiles` lists nonsecret saved connection profiles.
+- `POST /api/profiles` creates or updates a profile. Password and client-key fields are rejected.
+- `DELETE /api/profiles/{id}` removes a profile.
+- `GET /api/history` lists at most 100 recent query executions, newest first.
+- `DELETE /api/history` clears query history.
+
 Connection input:
 
 ```json
@@ -53,7 +61,7 @@ TLS mode is one of `disabled`, `system`, `custom`, or `mutual`. Custom mode requ
 
 ### Query stream and cancellation
 
-`POST /api/connections/{id}/queries` accepts `{ "sql", "maxRows"? }` and responds with `Content-Type: application/x-ndjson`. Each line is one event. The first event is flushed immediately so cancellation works while database execution is still pending:
+`POST /api/connections/{id}/queries` accepts `{ "sql", "maxRows"?, "recordHistory"? }` and responds with `Content-Type: application/x-ndjson`. Each line is one event. The first event is flushed immediately so cancellation works while database execution is still pending:
 
 ```jsonl
 {"type":"started","queryId":"q_123"}
@@ -74,6 +82,6 @@ Rows are positional arrays. `BIGINT` and `DECIMAL` values must be encoded as str
 
 ## Current Phase 1–2 boundary
 
-Implemented: direct connection form with TLS inputs, connection test, database/table/column browsing, one-click bounded table previews, schema filtering, SQL editing and completion from loaded names, run selection or full editor with `Cmd/Ctrl+Enter`, streaming results, bounded DOM rendering, cancellation, loaded-result TSV copy/CSV export, and visible errors/status.
+Implemented: direct connection form with TLS inputs, persistent nonsecret profiles, connection test, database/table/column browsing, one-click bounded table previews, schema filtering, SQL editing and completion from loaded names, run selection or full editor with `Cmd/Ctrl+Enter`, streaming results, bounded DOM rendering, cancellation, capped/optional query history, loaded-result TSV copy/CSV export, and visible errors/status.
 
-Deferred: saved profiles, history, result editing, full cell inspector, server-side filtering/paging, and write sessions.
+Deferred: result editing, full cell inspector, server-side filtering/paging, Keychain password storage, and write sessions.

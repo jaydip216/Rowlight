@@ -1,11 +1,15 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"testing/fstest"
+
+	appstate "github.com/jaydip216/db0/internal/state"
 )
 
 func TestLocalAPIAuthorization(t *testing.T) {
@@ -64,4 +68,65 @@ func TestRootServesIndexWithoutRedirect(t *testing.T) {
 	if got := res.Body.String(); got != "<!doctype html><title>db0</title>" {
 		t.Fatalf("body = %q", got)
 	}
+}
+
+func TestProfilesAndHistoryAPI(t *testing.T) {
+	t.Parallel()
+	web := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ok")}}
+	app := New("secret", fs.FS(web))
+
+	profile := []byte(`{"name":"Local","host":"127.0.0.1","port":3306,"user":"reader","database":"app","tls":{"mode":"disabled"}}`)
+	create := apiRequest(app, http.MethodPost, "/api/profiles", profile)
+	if create.Code != http.StatusOK {
+		t.Fatalf("create profile status = %d: %s", create.Code, create.Body.String())
+	}
+	var saved appstate.Profile
+	if err := json.Unmarshal(create.Body.Bytes(), &saved); err != nil || saved.ID == "" {
+		t.Fatalf("saved profile = %+v, error = %v", saved, err)
+	}
+
+	list := apiRequest(app, http.MethodGet, "/api/profiles", nil)
+	if list.Code != http.StatusOK || !bytes.Contains(list.Body.Bytes(), []byte(`"name":"Local"`)) {
+		t.Fatalf("list profiles status = %d: %s", list.Code, list.Body.String())
+	}
+
+	if err := app.state.AddHistory(appstate.HistoryEntry{SQL: "SELECT 1"}); err != nil {
+		t.Fatal(err)
+	}
+	history := apiRequest(app, http.MethodGet, "/api/history", nil)
+	if history.Code != http.StatusOK || !bytes.Contains(history.Body.Bytes(), []byte("SELECT 1")) {
+		t.Fatalf("history status = %d: %s", history.Code, history.Body.String())
+	}
+	cleared := apiRequest(app, http.MethodDelete, "/api/history", nil)
+	if cleared.Code != http.StatusNoContent || len(app.state.History()) != 0 {
+		t.Fatalf("clear history status = %d", cleared.Code)
+	}
+}
+
+func TestBrowseAPIValidationAndConnectionLookup(t *testing.T) {
+	t.Parallel()
+	web := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ok")}}
+	app := New("secret", fs.FS(web))
+
+	invalid := apiRequest(app, http.MethodPost, "/api/connections/missing/browse", []byte(`{"schema":"","table":"customers","pageSize":20}`))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid browse status = %d: %s", invalid.Code, invalid.Body.String())
+	}
+
+	missing := apiRequest(app, http.MethodPost, "/api/connections/missing/browse", []byte(`{"schema":"app","table":"customers","pageSize":20}`))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing connection status = %d: %s", missing.Code, missing.Body.String())
+	}
+}
+
+func apiRequest(app http.Handler, method, path string, body []byte) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, "http://127.0.0.1:7777"+path, bytes.NewReader(body))
+	req.Host = "127.0.0.1:7777"
+	req.Header.Set("Authorization", "Bearer secret")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res := httptest.NewRecorder()
+	app.ServeHTTP(res, req)
+	return res
 }

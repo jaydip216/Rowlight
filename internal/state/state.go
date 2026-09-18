@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,7 +34,7 @@ type Profile struct {
 	Host      string     `json:"host"`
 	Port      int        `json:"port"`
 	User      string     `json:"user"`
-	Database  string     `json:"database,omitempty"`
+	Database  string     `json:"database"`
 	TLS       TLSProfile `json:"tls"`
 	CreatedAt time.Time  `json:"createdAt"`
 	UpdatedAt time.Time  `json:"updatedAt"`
@@ -92,6 +93,9 @@ func Open(path string) (*Store, error) {
 	if s.data.History == nil {
 		s.data.History = []HistoryEntry{}
 	}
+	sort.SliceStable(s.data.History, func(i, j int) bool {
+		return s.data.History[i].ExecutedAt.After(s.data.History[j].ExecutedAt)
+	})
 	if len(s.data.History) > maxHistory {
 		s.data.History = s.data.History[:maxHistory]
 	}

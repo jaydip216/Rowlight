@@ -19,7 +19,11 @@ import (
 	mysql "github.com/go-sql-driver/mysql"
 )
 
-var ErrNotFound = errors.New("connection not found")
+var (
+	ErrNotFound       = errors.New("connection not found")
+	ErrInvalidBrowse  = errors.New("invalid browse request")
+	ErrBrowseNotFound = errors.New("table or view not found")
+)
 
 type TLSRequest struct {
 	Mode          string `json:"mode"`
@@ -46,6 +50,11 @@ type Connection struct {
 	tlsName       string
 }
 
+type ConnectionInfo struct {
+	ServerVersion string
+	Database      string
+}
+
 type Table struct {
 	Name string `json:"name"`
 	Type string `json:"type"`
@@ -62,8 +71,43 @@ type Column struct {
 }
 
 type QueryRequest struct {
-	SQL     string `json:"sql"`
-	MaxRows int    `json:"maxRows"`
+	SQL           string `json:"sql"`
+	MaxRows       int    `json:"maxRows"`
+	RecordHistory *bool  `json:"recordHistory,omitempty"`
+}
+
+type BrowseSort struct {
+	Column    string `json:"column"`
+	Direction string `json:"direction"`
+}
+
+type BrowseFilter struct {
+	Column   string  `json:"column"`
+	Operator string  `json:"operator"`
+	Value    *string `json:"value,omitempty"`
+}
+
+type BrowseRequest struct {
+	Schema   string         `json:"schema"`
+	Table    string         `json:"table"`
+	Offset   int            `json:"offset"`
+	PageSize int            `json:"pageSize"`
+	Sort     *BrowseSort    `json:"sort,omitempty"`
+	Filters  []BrowseFilter `json:"filters,omitempty"`
+}
+
+type BrowseColumn struct {
+	Name         string `json:"name"`
+	DatabaseType string `json:"databaseType"`
+	Nullable     bool   `json:"nullable"`
+}
+
+type BrowseResult struct {
+	Columns  []BrowseColumn `json:"columns"`
+	Rows     [][]any        `json:"rows"`
+	Offset   int            `json:"offset"`
+	PageSize int            `json:"pageSize"`
+	HasMore  bool           `json:"hasMore"`
 }
 
 type Store struct {
@@ -237,6 +281,14 @@ func (s *Store) get(id string) (*Connection, error) {
 	return c, nil
 }
 
+func (s *Store) Info(id string) (ConnectionInfo, error) {
+	c, err := s.get(id)
+	if err != nil {
+		return ConnectionInfo{}, err
+	}
+	return ConnectionInfo{ServerVersion: c.ServerVersion, Database: c.Database}, nil
+}
+
 func (s *Store) Schemas(ctx context.Context, id string) ([]string, error) {
 	c, err := s.get(id)
 	if err != nil {
@@ -304,6 +356,204 @@ func (s *Store) Columns(ctx context.Context, id, schema, table string) ([]Column
 		out = append(out, value)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) Browse(ctx context.Context, connectionID string, req BrowseRequest) (BrowseResult, error) {
+	if err := normalizeBrowseRequest(&req); err != nil {
+		return BrowseResult{}, err
+	}
+	c, err := s.get(connectionID)
+	if err != nil {
+		return BrowseResult{}, err
+	}
+	select {
+	case s.querySlots <- struct{}{}:
+		defer func() { <-s.querySlots }()
+	case <-ctx.Done():
+		return BrowseResult{}, ctx.Err()
+	}
+
+	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return BrowseResult{}, fmt.Errorf("start read-only browse transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	columns, err := browseColumns(ctx, tx, req.Schema, req.Table)
+	if err != nil {
+		return BrowseResult{}, err
+	}
+	if len(columns) == 0 {
+		return BrowseResult{}, fmt.Errorf("%w: %s.%s", ErrBrowseNotFound, req.Schema, req.Table)
+	}
+	query, args, err := buildBrowseQuery(req, columns)
+	if err != nil {
+		return BrowseResult{}, err
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return BrowseResult{}, err
+	}
+	defer rows.Close()
+
+	columnTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return BrowseResult{}, err
+	}
+	result := BrowseResult{
+		Columns:  make([]BrowseColumn, len(columnTypes)),
+		Rows:     make([][]any, 0, req.PageSize),
+		Offset:   req.Offset,
+		PageSize: req.PageSize,
+	}
+	for i, columnType := range columnTypes {
+		nullable, known := columnType.Nullable()
+		if !known {
+			nullable = columns[i].Nullable
+		}
+		result.Columns[i] = BrowseColumn{Name: columnType.Name(), DatabaseType: columnType.DatabaseTypeName(), Nullable: nullable}
+	}
+
+	const maxBytes = 8 << 20
+	const maxCellBytes = 1 << 20
+	values := make([]any, len(columnTypes))
+	pointers := make([]any, len(values))
+	for i := range values {
+		pointers[i] = &values[i]
+	}
+	totalBytes := 0
+	for rows.Next() {
+		if len(result.Rows) >= req.PageSize || totalBytes >= maxBytes {
+			result.HasMore = true
+			break
+		}
+		if err := rows.Scan(pointers...); err != nil {
+			return BrowseResult{}, err
+		}
+		row := make([]any, len(values))
+		for i, value := range values {
+			converted, size, _ := transportValue(value, maxCellBytes)
+			row[i] = converted
+			totalBytes += size
+		}
+		result.Rows = append(result.Rows, row)
+	}
+	if err := rows.Err(); err != nil {
+		return BrowseResult{}, err
+	}
+	return result, nil
+}
+
+type browseQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func browseColumns(ctx context.Context, queryer browseQuerier, schema, table string) ([]BrowseColumn, error) {
+	rows, err := queryer.QueryContext(ctx, `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var columns []BrowseColumn
+	for rows.Next() {
+		var column BrowseColumn
+		var nullable string
+		if err := rows.Scan(&column.Name, &column.DatabaseType, &nullable); err != nil {
+			return nil, err
+		}
+		column.Nullable = nullable == "YES"
+		columns = append(columns, column)
+	}
+	return columns, rows.Err()
+}
+
+func normalizeBrowseRequest(req *BrowseRequest) error {
+	if strings.TrimSpace(req.Schema) == "" || strings.TrimSpace(req.Table) == "" {
+		return fmt.Errorf("%w: schema and table are required", ErrInvalidBrowse)
+	}
+	if req.Offset < 0 {
+		return fmt.Errorf("%w: offset cannot be negative", ErrInvalidBrowse)
+	}
+	if req.PageSize == 0 {
+		req.PageSize = 100
+	}
+	if req.PageSize < 1 || req.PageSize > 200 {
+		return fmt.Errorf("%w: pageSize must be between 1 and 200", ErrInvalidBrowse)
+	}
+	if len(req.Filters) > 20 {
+		return fmt.Errorf("%w: at most 20 filters are allowed", ErrInvalidBrowse)
+	}
+	return nil
+}
+
+func buildBrowseQuery(req BrowseRequest, columns []BrowseColumn) (string, []any, error) {
+	knownColumns := make(map[string]struct{}, len(columns))
+	quotedColumns := make([]string, len(columns))
+	for i, column := range columns {
+		knownColumns[column.Name] = struct{}{}
+		quotedColumns[i] = quoteIdentifier(column.Name)
+	}
+	query := "SELECT " + strings.Join(quotedColumns, ", ") + " FROM " + quoteIdentifier(req.Schema) + "." + quoteIdentifier(req.Table)
+	conditions := make([]string, 0, len(req.Filters))
+	args := make([]any, 0, len(req.Filters)+2)
+	for _, filter := range req.Filters {
+		if _, ok := knownColumns[filter.Column]; !ok {
+			return "", nil, fmt.Errorf("%w: unknown filter column %q", ErrInvalidBrowse, filter.Column)
+		}
+		column := quoteIdentifier(filter.Column)
+		switch filter.Operator {
+		case "equals":
+			if filter.Value == nil {
+				return "", nil, fmt.Errorf("%w: equals requires a value", ErrInvalidBrowse)
+			}
+			conditions = append(conditions, column+" = ?")
+			args = append(args, *filter.Value)
+		case "contains":
+			if filter.Value == nil {
+				return "", nil, fmt.Errorf("%w: contains requires a value", ErrInvalidBrowse)
+			}
+			conditions = append(conditions, "LOCATE(?, "+column+") > 0")
+			args = append(args, *filter.Value)
+		case "startsWith":
+			if filter.Value == nil {
+				return "", nil, fmt.Errorf("%w: startsWith requires a value", ErrInvalidBrowse)
+			}
+			conditions = append(conditions, "LEFT("+column+", CHAR_LENGTH(?)) = ?")
+			args = append(args, *filter.Value, *filter.Value)
+		case "isNull":
+			if filter.Value != nil {
+				return "", nil, fmt.Errorf("%w: isNull does not accept a value", ErrInvalidBrowse)
+			}
+			conditions = append(conditions, column+" IS NULL")
+		case "isNotNull":
+			if filter.Value != nil {
+				return "", nil, fmt.Errorf("%w: isNotNull does not accept a value", ErrInvalidBrowse)
+			}
+			conditions = append(conditions, column+" IS NOT NULL")
+		default:
+			return "", nil, fmt.Errorf("%w: unsupported filter operator %q", ErrInvalidBrowse, filter.Operator)
+		}
+	}
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	if req.Sort != nil {
+		if _, ok := knownColumns[req.Sort.Column]; !ok {
+			return "", nil, fmt.Errorf("%w: unknown sort column %q", ErrInvalidBrowse, req.Sort.Column)
+		}
+		direction := strings.ToUpper(req.Sort.Direction)
+		if direction != "ASC" && direction != "DESC" {
+			return "", nil, fmt.Errorf("%w: sort direction must be asc or desc", ErrInvalidBrowse)
+		}
+		query += " ORDER BY " + quoteIdentifier(req.Sort.Column) + " " + direction
+	}
+	query += " LIMIT ? OFFSET ?"
+	args = append(args, req.PageSize+1, req.Offset)
+	return query, args, nil
+}
+
+func quoteIdentifier(value string) string {
+	return "`" + strings.ReplaceAll(value, "`", "``") + "`"
 }
 
 func (s *Store) StreamQuery(parent context.Context, connectionID string, req QueryRequest, write func(any) error) error {

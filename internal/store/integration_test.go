@@ -29,6 +29,10 @@ func TestMariaDBIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	info, err := s.Info(c.ID)
+	if err != nil || info.Database != c.Database || info.ServerVersion == "" {
+		t.Fatalf("Info() = %+v, %v", info, err)
+	}
 
 	schemas, err := s.Schemas(ctx, c.ID)
 	if err != nil || !contains(schemas, c.Database) {
@@ -41,6 +45,20 @@ func TestMariaDBIntegration(t *testing.T) {
 	columns, err := s.Columns(ctx, c.ID, c.Database, "customers")
 	if err != nil || len(columns) < 6 {
 		t.Fatalf("Columns() count = %d, error = %v", len(columns), err)
+	}
+	browsed, err := s.Browse(ctx, c.ID, BrowseRequest{
+		Schema: c.Database, Table: "customers", PageSize: 1,
+		Sort:    &BrowseSort{Column: "id", Direction: "asc"},
+		Filters: []BrowseFilter{{Column: "email", Operator: "isNotNull"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(browsed.Columns) < 6 || len(browsed.Rows) != 1 || !browsed.HasMore || browsed.PageSize != 1 {
+		t.Fatalf("Browse() = %+v", browsed)
+	}
+	if _, err := s.Browse(ctx, c.ID, BrowseRequest{Schema: c.Database, Table: "customers", PageSize: 10, Sort: &BrowseSort{Column: "not_a_column", Direction: "asc"}}); !errors.Is(err, ErrInvalidBrowse) {
+		t.Fatalf("Browse() unknown column error = %v, want ErrInvalidBrowse", err)
 	}
 
 	var events []map[string]any
