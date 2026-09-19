@@ -1,4 +1,4 @@
-.PHONY: build frontend test dev-backend release-darwin benchmark browser-smoke clean
+.PHONY: build frontend test installer-test dev-backend release-darwin benchmark browser-smoke clean
 
 GOCACHE ?= /tmp/rowlight-gocache
 GOMODCACHE ?= /tmp/rowlight-gomodcache
@@ -15,6 +15,9 @@ frontend:
 
 test: frontend
 	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) go test ./...
+
+installer-test:
+	sh -n ./install.sh
 
 dev-backend: frontend
 	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) go run . -no-open -port 7070
