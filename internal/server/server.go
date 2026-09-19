@@ -42,6 +42,8 @@ func NewWithState(token string, web fs.FS, persistent *appstate.Store) *Server {
 	mux.HandleFunc("POST /api/connections", s.createConnection)
 	mux.HandleFunc("GET /api/connections/{id}", s.connection)
 	mux.HandleFunc("DELETE /api/connections/{id}", s.deleteConnection)
+	mux.HandleFunc("GET /api/connections/{id}/health", s.connectionHealth)
+	mux.HandleFunc("POST /api/connections/{id}/reconnect", s.reconnectConnection)
 	mux.HandleFunc("GET /api/connections/{id}/schemas", s.schemas)
 	mux.HandleFunc("GET /api/connections/{id}/schemas/{schema}/tables", s.tables)
 	mux.HandleFunc("GET /api/connections/{id}/schemas/{schema}/tables/{table}/columns", s.columns)
@@ -204,6 +206,30 @@ func (s *Server) connection(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) connectionHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := contextWithTimeout(r, 5*time.Second)
+	defer cancel()
+	health, err := s.store.Health(ctx, r.PathValue("id"))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, health)
+}
+
+func (s *Server) reconnectConnection(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := contextWithTimeout(r, 10*time.Second)
+	defer cancel()
+	info, err := s.store.Reconnect(ctx, r.PathValue("id"))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id": r.PathValue("id"), "engine": info.Engine, "serverVersion": info.ServerVersion, "database": info.Database,
+	})
+}
+
 func (s *Server) deleteConnection(w http.ResponseWriter, r *http.Request) {
 	if !s.store.Close(r.PathValue("id")) {
 		writeError(w, http.StatusNotFound, "connection not found")
@@ -277,10 +303,17 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 	var elapsedMS int64
 	var truncated bool
 	write := func(v any) error {
-		if event, ok := v.(map[string]any); ok && event["type"] == "complete" {
-			rowCount = numberAsInt64(event["rowCount"])
-			elapsedMS = numberAsInt64(event["elapsedMs"])
-			truncated, _ = event["truncated"].(bool)
+		if event, ok := v.(map[string]any); ok {
+			switch event["type"] {
+			case "rows":
+				if rows, ok := event["rows"].([][]any); ok {
+					rowCount += int64(len(rows))
+				}
+			case "complete":
+				rowCount = numberAsInt64(event["rowCount"])
+				elapsedMS = numberAsInt64(event["elapsedMs"])
+				truncated, _ = event["truncated"].(bool)
+			}
 		}
 		if err := enc.Encode(v); err != nil {
 			return err
@@ -294,7 +327,16 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 	history := appstate.HistoryEntry{SQL: req.SQL, Engine: info.Engine, Database: info.Database, Server: info.ServerVersion, ExecutedAt: executedAt, ElapsedMS: elapsedMS, RowCount: rowCount, Truncated: truncated}
 	if err != nil {
 		history.Error = err.Error()
-		_ = write(map[string]any{"type": "error", "error": err.Error()})
+		if errors.Is(err, context.Canceled) {
+			elapsedMS = time.Since(executedAt).Milliseconds()
+			history.ElapsedMS = elapsedMS
+			history.Error = "cancelled"
+			_ = write(map[string]any{"type": "cancelled", "rowCount": rowCount, "elapsedMs": elapsedMS})
+		} else if errors.Is(err, store.ErrConnectionUnavailable) || store.IsConnectionFailure(err) {
+			_ = write(map[string]any{"type": "error", "error": err.Error(), "code": "connection_unavailable", "retryable": true})
+		} else {
+			_ = write(map[string]any{"type": "error", "error": err.Error(), "retryable": false})
+		}
 	}
 	if req.RecordHistory == nil || *req.RecordHistory {
 		if saveErr := s.state.AddHistory(history); saveErr != nil {
@@ -370,6 +412,10 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
+func writeAPIError(w http.ResponseWriter, status int, message, code string, retryable bool) {
+	writeJSON(w, status, map[string]any{"error": message, "code": code, "retryable": retryable})
+}
+
 func writeStoreError(w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrInvalidConnection) {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -385,6 +431,18 @@ func writeStoreError(w http.ResponseWriter, err error) {
 	}
 	if errors.Is(err, store.ErrInvalidBrowse) {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrConnectionUnavailable) {
+		writeAPIError(w, http.StatusServiceUnavailable, err.Error(), "connection_unavailable", true)
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		writeAPIError(w, http.StatusGatewayTimeout, "database operation timed out", "database_timeout", true)
+		return
+	}
+	if store.IsConnectionFailure(err) {
+		writeAPIError(w, http.StatusServiceUnavailable, err.Error(), "connection_unavailable", true)
 		return
 	}
 	writeError(w, http.StatusBadGateway, err.Error())

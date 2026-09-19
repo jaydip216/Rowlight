@@ -1,7 +1,9 @@
-.PHONY: build frontend test dev-backend clean
+.PHONY: build frontend test dev-backend release-darwin benchmark browser-smoke clean
 
 GOCACHE ?= /tmp/rowlight-gocache
 GOMODCACHE ?= /tmp/rowlight-gomodcache
+VERSION ?= dev
+RELEASE_DIR ?= release
 
 build: frontend
 	mkdir -p bin
@@ -17,5 +19,14 @@ test: frontend
 dev-backend: frontend
 	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) go run . -no-open -port 7070
 
+release-darwin: frontend
+	VERSION=$(VERSION) RELEASE_DIR=$(RELEASE_DIR) GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) ./scripts/release-darwin.sh
+
+benchmark: build
+	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) ./scripts/benchmark.sh ./bin/rowlight
+
+browser-smoke:
+	node ./scripts/webdriver-smoke.mjs
+
 clean:
-	rm -rf bin web/dist
+	rm -rf bin web/dist $(RELEASE_DIR)

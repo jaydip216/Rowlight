@@ -85,3 +85,4 @@ transcripts/
 .geminiignore
 .continueignore
 .windsurfignore
+/release/

@@ -22,12 +22,13 @@ func TestPostgresIntegration(t *testing.T) {
 	t.Cleanup(s.CloseAll)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	c, err := s.Connect(ctx, ConnectionRequest{
+	req := ConnectionRequest{
 		Engine: EnginePostgres,
 		Host:   envOr("ROWLIGHT_POSTGRES_HOST", "127.0.0.1"), Port: port,
 		User: envOr("ROWLIGHT_POSTGRES_USER", "rowlight"), Password: envOr("ROWLIGHT_POSTGRES_PASSWORD", "rowlight"),
 		Database: envOr("ROWLIGHT_POSTGRES_DATABASE", "rowlight_test"), TLS: TLSRequest{Mode: "disabled"},
-	})
+	}
+	c, err := s.Connect(ctx, req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +52,14 @@ func TestPostgresIntegration(t *testing.T) {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {
 			t.Fatalf("create PostgreSQL fixtures: %v", err)
 		}
+	}
+
+	health, err := s.Health(ctx, c.ID)
+	if err != nil || health.Status != "healthy" {
+		t.Fatalf("Health() = %+v, %v", health, err)
+	}
+	if _, err := s.Reconnect(ctx, c.ID); err != nil {
+		t.Fatalf("Reconnect() = %v", err)
 	}
 
 	info, err := s.Info(c.ID)
@@ -162,6 +171,7 @@ func TestPostgresIntegration(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("follow-up query after PostgreSQL cancellation failed: %v", err)
 	}
+	exerciseConnectionLifecycle(t, s, req)
 }
 
 func containsTable(tables []Table, name, tableType string) bool {

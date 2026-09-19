@@ -26,10 +26,21 @@ import (
 //go:embed web/dist
 var webAssets embed.FS
 
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
+)
+
 func main() {
 	noOpen := flag.Bool("no-open", false, "do not open the browser")
 	port := flag.Int("port", 0, "loopback port (0 chooses a free port)")
+	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("Rowlight %s (commit %s, built %s)\n", version, commit, buildDate)
+		return
+	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *port))
 	if err != nil {

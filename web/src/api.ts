@@ -28,9 +28,9 @@ function apiHeaders(headers?: HeadersInit): Headers {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
-    super(message);
-  }
+  constructor(message: string, readonly status: number, readonly code?: string, readonly retryable = false) {
+		super(message);
+	}
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -44,14 +44,18 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 async function responseError(response: Response): Promise<ApiError> {
-  let message = `${response.status} ${response.statusText}`;
-  try {
-    const value = (await response.json()) as { error?: string; message?: string };
-    if (value.error || value.message) message = value.error ?? value.message ?? message;
-  } catch {
-    // Keep the HTTP status when the response is not JSON.
-  }
-  return new ApiError(message, response.status);
+	let message = `${response.status} ${response.statusText}`;
+	let code: string | undefined;
+	let retryable = false;
+	try {
+		const value = (await response.json()) as { error?: string; message?: string; code?: string; retryable?: boolean };
+		if (value.error || value.message) message = value.error ?? value.message ?? message;
+		code = value.code;
+		retryable = value.retryable === true;
+	} catch {
+		// Keep the HTTP status when the response is not JSON.
+	}
+	return new ApiError(message, response.status, code, retryable);
 }
 
 const segment = (value: string) => encodeURIComponent(value);
@@ -93,6 +97,14 @@ export const api = {
 
   connection(id: string): Promise<Connection> {
     return request(`/api/connections/${segment(id)}`);
+  },
+
+  reconnect(id: string): Promise<Connection> {
+    return request(`/api/connections/${segment(id)}/reconnect`, { method: "POST" });
+  },
+
+  connectionHealth(id: string): Promise<{ status: "healthy"; latencyMs: number }> {
+    return request(`/api/connections/${segment(id)}/health`);
   },
 
   disconnect(id: string): Promise<void> {

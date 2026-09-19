@@ -15,13 +15,17 @@ The backend launches the page with `#token=<random-token>`. The frontend reads t
 
 ## Backend API contract
 
-All endpoints return JSON errors as `{ "error": "…" }` (the frontend also accepts `message` for compatibility). Database identifiers are URL-encoded path segments. Secrets are accepted only in request bodies and must never be logged.
+All endpoints return JSON errors with an `error` string. Recoverable failures also include stable `code` and `retryable` fields, for example `{ "error": "…", "code": "connection_unavailable", "retryable": true }`. The frontend also accepts `message` for compatibility. Database identifiers are URL-encoded path segments. Secrets are accepted only in request bodies and must never be logged.
 
 ### Connections
 
 - `POST /api/connections` accepts a connection input and returns `{ "id", "engine", "serverVersion", "database" }`.
 - `GET /api/connections/{id}` returns the same connection identity so a browser refresh can restore the active engine and session.
+- `GET /api/connections/{id}/health` pings the database and returns `{ "status": "healthy", "latencyMs": 2 }`.
+- `POST /api/connections/{id}/reconnect` asks the existing pool to establish a usable connection and returns the connection identity.
 - `DELETE /api/connections/{id}` closes the connection and may return `204 No Content`.
+
+Metadata and table-browse operations retry exactly once in the backend after a recognized transport failure. Arbitrary SQL is never replayed. The UI preserves the editor and exposes Reconnect so the user can decide whether to run it again.
 
 The Test connection action uses the same create endpoint and immediately deletes the returned connection, so the backend needs no separate test route.
 
@@ -95,7 +99,7 @@ The terminal event is exactly one of:
 
 - `{ "type": "complete", "rowCount", "elapsedMs", "truncated" }`
 - `{ "type": "cancelled", "rowCount", "elapsedMs" }`
-- `{ "type": "error", "error": "…" }`
+- `{ "type": "error", "error": "…", "code"?: "connection_unavailable", "retryable"?: true }`
 
 Rows are positional arrays. `BIGINT` and `DECIMAL` values must be encoded as strings, and SQL `NULL` as JSON `null`. The backend limits delivered rows/bytes and reports `truncated: true` when it stops at the limit.
 

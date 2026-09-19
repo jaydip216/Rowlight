@@ -97,4 +97,4 @@ export type QueryEvent =
   | { type: "rows"; rows: CellValue[][] }
   | { type: "complete"; rowCount: number; elapsedMs: number; truncated: boolean }
   | { type: "cancelled"; rowCount: number; elapsedMs: number }
-  | { type: "error"; error: string };
+  | { type: "error"; error: string; code?: string; retryable?: boolean };

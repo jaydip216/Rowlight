@@ -21,14 +21,32 @@ func TestMariaDBIntegration(t *testing.T) {
 	t.Cleanup(s.CloseAll)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	c, err := s.Connect(ctx, ConnectionRequest{
+	tlsRequest := TLSRequest{Mode: envOr("ROWLIGHT_TEST_TLS", "disabled")}
+	if path := os.Getenv("ROWLIGHT_TEST_CA_FILE"); path != "" {
+		pem, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read test CA: %v", err)
+		}
+		tlsRequest.CAPEM = string(pem)
+	}
+	tlsRequest.ServerName = os.Getenv("ROWLIGHT_TEST_SERVER_NAME")
+	req := ConnectionRequest{
 		Host: envOr("ROWLIGHT_TEST_HOST", "127.0.0.1"), Port: port,
 		User: os.Getenv("ROWLIGHT_TEST_USER"), Password: os.Getenv("ROWLIGHT_TEST_PASSWORD"),
-		Database: os.Getenv("ROWLIGHT_TEST_DATABASE"), TLS: TLSRequest{Mode: envOr("ROWLIGHT_TEST_TLS", "disabled")},
-	})
+		Database: os.Getenv("ROWLIGHT_TEST_DATABASE"), TLS: tlsRequest,
+	}
+	c, err := s.Connect(ctx, req)
 	if err != nil {
 		t.Fatal(err)
 	}
+	health, err := s.Health(ctx, c.ID)
+	if err != nil || health.Status != "healthy" {
+		t.Fatalf("Health() = %+v, %v", health, err)
+	}
+	if _, err := s.Reconnect(ctx, c.ID); err != nil {
+		t.Fatalf("Reconnect() = %v", err)
+	}
+
 	info, err := s.Info(c.ID)
 	if err != nil || info.Database != c.Database || info.ServerVersion == "" {
 		t.Fatalf("Info() = %+v, %v", info, err)
@@ -136,6 +154,34 @@ func TestMariaDBIntegration(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("follow-up query after cancellation failed: %v", err)
+	}
+	exerciseConnectionLifecycle(t, s, req)
+}
+
+func exerciseConnectionLifecycle(t *testing.T, s *Store, req ConnectionRequest) {
+	t.Helper()
+	for iteration := 0; iteration < 20; iteration++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		connection, err := s.Connect(ctx, req)
+		if err != nil {
+			cancel()
+			t.Fatalf("lifecycle connect %d: %v", iteration, err)
+		}
+		if err := s.StreamQuery(ctx, connection.ID, QueryRequest{SQL: "SELECT 1"}, func(any) error { return nil }); err != nil {
+			cancel()
+			t.Fatalf("lifecycle query %d: %v", iteration, err)
+		}
+		if !s.Close(connection.ID) {
+			cancel()
+			t.Fatalf("lifecycle close %d did not find connection", iteration)
+		}
+		cancel()
+	}
+	s.mu.RLock()
+	activeQueries := len(s.queries)
+	s.mu.RUnlock()
+	if activeQueries != 0 || len(s.querySlots) != 0 {
+		t.Fatalf("lifecycle leaked resources: active queries=%d occupied slots=%d", activeQueries, len(s.querySlots))
 	}
 }
 

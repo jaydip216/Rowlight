@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io/fs"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"testing/fstest"
 
 	appstate "github.com/jaydip216/Rowlight/internal/state"
+	"github.com/jaydip216/Rowlight/internal/store"
 )
 
 func TestLocalAPIAuthorization(t *testing.T) {
@@ -44,6 +46,38 @@ func TestLocalAPIAuthorization(t *testing.T) {
 			app.ServeHTTP(res, req)
 			if res.Code != tt.status {
 				t.Fatalf("status = %d, want %d: %s", res.Code, tt.status, res.Body.String())
+			}
+		})
+	}
+}
+
+func TestWriteStoreErrorReturnsStableRecoveryMetadata(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		status    int
+		code      string
+		retryable bool
+	}{
+		{name: "connection unavailable", err: store.ErrConnectionUnavailable, status: http.StatusServiceUnavailable, code: "connection_unavailable", retryable: true},
+		{name: "deadline", err: context.DeadlineExceeded, status: http.StatusGatewayTimeout, code: "database_timeout", retryable: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := httptest.NewRecorder()
+			writeStoreError(res, tt.err)
+			if res.Code != tt.status {
+				t.Fatalf("status = %d, want %d", res.Code, tt.status)
+			}
+			var body struct {
+				Code      string `json:"code"`
+				Retryable bool   `json:"retryable"`
+			}
+			if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Code != tt.code || body.Retryable != tt.retryable {
+				t.Fatalf("body = %+v, want code %q retryable %v", body, tt.code, tt.retryable)
 			}
 		})
 	}
@@ -134,6 +168,15 @@ func TestBrowseAPIValidationAndConnectionLookup(t *testing.T) {
 	missing := apiRequest(app, http.MethodPost, "/api/connections/missing/browse", []byte(`{"schema":"app","table":"customers","pageSize":20}`))
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("missing connection status = %d: %s", missing.Code, missing.Body.String())
+	}
+
+	health := apiRequest(app, http.MethodGet, "/api/connections/missing/health", nil)
+	if health.Code != http.StatusNotFound {
+		t.Fatalf("missing health status = %d: %s", health.Code, health.Body.String())
+	}
+	reconnect := apiRequest(app, http.MethodPost, "/api/connections/missing/reconnect", nil)
+	if reconnect.Code != http.StatusNotFound {
+		t.Fatalf("missing reconnect status = %d: %s", reconnect.Code, reconnect.Body.String())
 	}
 }
 

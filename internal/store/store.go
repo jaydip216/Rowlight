@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -27,10 +29,11 @@ const (
 )
 
 var (
-	ErrNotFound          = errors.New("connection not found")
-	ErrInvalidConnection = errors.New("invalid connection request")
-	ErrInvalidBrowse     = errors.New("invalid browse request")
-	ErrBrowseNotFound    = errors.New("table or view not found")
+	ErrNotFound              = errors.New("connection not found")
+	ErrInvalidConnection     = errors.New("invalid connection request")
+	ErrInvalidBrowse         = errors.New("invalid browse request")
+	ErrBrowseNotFound        = errors.New("table or view not found")
+	ErrConnectionUnavailable = errors.New("database connection unavailable")
 )
 
 type TLSRequest struct {
@@ -64,6 +67,11 @@ type ConnectionInfo struct {
 	Engine        string
 	ServerVersion string
 	Database      string
+}
+
+type ConnectionHealth struct {
+	Status    string `json:"status"`
+	LatencyMS int64  `json:"latencyMs"`
 }
 
 type Table struct {
@@ -121,10 +129,15 @@ type BrowseResult struct {
 	HasMore  bool           `json:"hasMore"`
 }
 
+type activeQuery struct {
+	connectionID string
+	cancel       context.CancelFunc
+}
+
 type Store struct {
 	mu          sync.RWMutex
 	connections map[string]*Connection
-	queries     map[string]context.CancelFunc
+	queries     map[string]activeQuery
 	querySlots  chan struct{}
 	sequence    atomic.Uint64
 }
@@ -132,7 +145,7 @@ type Store struct {
 func New() *Store {
 	return &Store{
 		connections: make(map[string]*Connection),
-		queries:     make(map[string]context.CancelFunc),
+		queries:     make(map[string]activeQuery),
 		querySlots:  make(chan struct{}, 2),
 	}
 }
@@ -163,6 +176,21 @@ func (s *Store) Connect(ctx context.Context, req ConnectionRequest) (*Connection
 		return nil, fmt.Errorf("%w: %v", ErrInvalidConnection, err)
 	}
 
+	db, tlsName, version, database, err := s.openConnection(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	c := &Connection{
+		ID: s.nextID(), Engine: req.Engine, ServerVersion: version, Database: database,
+		db: db, tlsName: tlsName,
+	}
+	s.mu.Lock()
+	s.connections[c.ID] = c
+	s.mu.Unlock()
+	return c, nil
+}
+
+func (s *Store) openConnection(ctx context.Context, req ConnectionRequest) (*sql.DB, string, string, string, error) {
 	var db *sql.DB
 	var tlsName string
 	var err error
@@ -172,36 +200,31 @@ func (s *Store) Connect(ctx context.Context, req ConnectionRequest) (*Connection
 		db, tlsName, err = s.openMySQL(req)
 	}
 	if err != nil {
-		return nil, err
+		return nil, "", "", "", err
+	}
+	cleanup := func() {
+		_ = db.Close()
+		if tlsName != "" {
+			mysql.DeregisterTLSConfig(tlsName)
+		}
 	}
 	db.SetMaxOpenConns(3)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		if tlsName != "" {
-			mysql.DeregisterTLSConfig(tlsName)
-		}
-		return nil, fmt.Errorf("connect: %w", err)
+		cleanup()
+		return nil, "", "", "", fmt.Errorf("connect: %w", err)
 	}
-
 	var version, database sql.NullString
 	infoQuery := "SELECT VERSION(), DATABASE()"
 	if req.Engine == EnginePostgres {
 		infoQuery = "SELECT VERSION(), current_database()"
 	}
 	if err := db.QueryRowContext(ctx, infoQuery).Scan(&version, &database); err != nil {
-		db.Close()
-		if tlsName != "" {
-			mysql.DeregisterTLSConfig(tlsName)
-		}
-		return nil, fmt.Errorf("read server information: %w", err)
+		cleanup()
+		return nil, "", "", "", fmt.Errorf("read server information: %w", err)
 	}
-	c := &Connection{ID: s.nextID(), Engine: req.Engine, ServerVersion: version.String, Database: database.String, db: db, tlsName: tlsName}
-	s.mu.Lock()
-	s.connections[c.ID] = c
-	s.mu.Unlock()
-	return c, nil
+	return db, tlsName, version.String, database.String, nil
 }
 
 func normalizeEngine(engine string) string {
@@ -320,18 +343,30 @@ func makeTLSConfig(host string, req TLSRequest) (*tls.Config, error) {
 	return cfg, nil
 }
 
+func closeDatabase(db *sql.DB, tlsName string) {
+	if db != nil {
+		_ = db.Close()
+	}
+	if tlsName != "" {
+		mysql.DeregisterTLSConfig(tlsName)
+	}
+}
+
 func (s *Store) Close(id string) bool {
 	s.mu.Lock()
 	c, ok := s.connections[id]
 	if ok {
 		delete(s.connections, id)
+		for queryID, query := range s.queries {
+			if query.connectionID == id {
+				query.cancel()
+				delete(s.queries, queryID)
+			}
+		}
 	}
 	s.mu.Unlock()
 	if ok {
-		_ = c.db.Close()
-		if c.tlsName != "" {
-			mysql.DeregisterTLSConfig(c.tlsName)
-		}
+		closeDatabase(c.db, c.tlsName)
 	}
 	return ok
 }
@@ -340,16 +375,13 @@ func (s *Store) CloseAll() {
 	s.mu.Lock()
 	items := s.connections
 	s.connections = make(map[string]*Connection)
-	for _, cancel := range s.queries {
-		cancel()
+	for _, query := range s.queries {
+		query.cancel()
 	}
-	s.queries = make(map[string]context.CancelFunc)
+	s.queries = make(map[string]activeQuery)
 	s.mu.Unlock()
 	for _, c := range items {
-		_ = c.db.Close()
-		if c.tlsName != "" {
-			mysql.DeregisterTLSConfig(c.tlsName)
-		}
+		closeDatabase(c.db, c.tlsName)
 	}
 }
 
@@ -371,29 +403,98 @@ func (s *Store) Info(id string) (ConnectionInfo, error) {
 	return ConnectionInfo{Engine: c.Engine, ServerVersion: c.ServerVersion, Database: c.Database}, nil
 }
 
+func (s *Store) Health(ctx context.Context, id string) (ConnectionHealth, error) {
+	c, err := s.get(id)
+	if err != nil {
+		return ConnectionHealth{}, err
+	}
+	started := time.Now()
+	if err := c.db.PingContext(ctx); err != nil {
+		return ConnectionHealth{Status: "unavailable", LatencyMS: time.Since(started).Milliseconds()}, fmt.Errorf("%w: %v", ErrConnectionUnavailable, err)
+	}
+	return ConnectionHealth{Status: "healthy", LatencyMS: time.Since(started).Milliseconds()}, nil
+}
+
+// Reconnect verifies the existing database/sql pool and lets it establish a fresh
+// socket when its previous connection has gone stale. Credentials remain owned by
+// the driver's connector; Rowlight does not keep a second plaintext copy.
+func (s *Store) Reconnect(ctx context.Context, id string) (ConnectionInfo, error) {
+	c, err := s.get(id)
+	if err != nil {
+		return ConnectionInfo{}, err
+	}
+	if err := c.db.PingContext(ctx); err != nil {
+		return ConnectionInfo{}, fmt.Errorf("%w: reconnect failed: %v", ErrConnectionUnavailable, err)
+	}
+	return ConnectionInfo{Engine: c.Engine, ServerVersion: c.ServerVersion, Database: c.Database}, nil
+}
+
+func retrySafeRead[T any](ctx context.Context, c *Connection, operation func(*sql.DB) (T, error)) (T, error) {
+	result, err := operation(c.db)
+	if err == nil || !IsConnectionFailure(err) || ctx.Err() != nil {
+		return result, err
+	}
+	var zero T
+	// Ping asks database/sql to discard a bad driver connection and establish a
+	// usable one. Only metadata and browse callers use this helper, so replay is safe.
+	if pingErr := c.db.PingContext(ctx); pingErr != nil {
+		return zero, fmt.Errorf("%w: reconnect failed: %v", ErrConnectionUnavailable, pingErr)
+	}
+	result, err = operation(c.db)
+	if err != nil && IsConnectionFailure(err) {
+		return zero, fmt.Errorf("%w: retry failed: %v", ErrConnectionUnavailable, err)
+	}
+	return result, err
+}
+
+func IsConnectionFailure(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.EOF) || errors.Is(err, sql.ErrConnDone) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, fragment := range []string{
+		"database is closed", "broken pipe", "connection refused", "connection reset",
+		"connection is closed", "server closed the connection", "unexpected eof",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) Schemas(ctx context.Context, id string) ([]string, error) {
 	c, err := s.get(id)
 	if err != nil {
 		return nil, err
 	}
-	query := `SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME`
-	if c.Engine == EnginePostgres {
-		query = `SELECT schema_name FROM information_schema.schemata WHERE schema_name <> 'information_schema' AND schema_name NOT LIKE 'pg\_%' ESCAPE '\' ORDER BY schema_name`
-	}
-	rows, err := c.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var value string
-		if err := rows.Scan(&value); err != nil {
+	return retrySafeRead(ctx, c, func(db *sql.DB) ([]string, error) {
+		query := `SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME`
+		if c.Engine == EnginePostgres {
+			query = `SELECT schema_name FROM information_schema.schemata WHERE schema_name <> 'information_schema' AND schema_name NOT LIKE 'pg\_%' ESCAPE '\' ORDER BY schema_name`
+		}
+		rows, err := db.QueryContext(ctx, query)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, value)
-	}
-	return out, rows.Err()
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var value string
+			if err := rows.Scan(&value); err != nil {
+				return nil, err
+			}
+			out = append(out, value)
+		}
+		return out, rows.Err()
+	})
 }
 
 func (s *Store) Tables(ctx context.Context, id, schema string) ([]Table, error) {
@@ -401,24 +502,26 @@ func (s *Store) Tables(ctx context.Context, id, schema string) ([]Table, error) 
 	if err != nil {
 		return nil, err
 	}
-	query := `SELECT TABLE_NAME, CASE TABLE_TYPE WHEN 'BASE TABLE' THEN 'table' WHEN 'VIEW' THEN 'view' ELSE LOWER(TABLE_TYPE) END FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME`
-	if c.Engine == EnginePostgres {
-		query = `SELECT table_name, CASE table_type WHEN 'BASE TABLE' THEN 'table' WHEN 'VIEW' THEN 'view' WHEN 'FOREIGN' THEN 'foreign table' ELSE LOWER(table_type) END FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name`
-	}
-	rows, err := c.db.QueryContext(ctx, query, schema)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Table
-	for rows.Next() {
-		var value Table
-		if err := rows.Scan(&value.Name, &value.Type); err != nil {
+	return retrySafeRead(ctx, c, func(db *sql.DB) ([]Table, error) {
+		query := `SELECT TABLE_NAME, CASE TABLE_TYPE WHEN 'BASE TABLE' THEN 'table' WHEN 'VIEW' THEN 'view' ELSE LOWER(TABLE_TYPE) END FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME`
+		if c.Engine == EnginePostgres {
+			query = `SELECT table_name, CASE table_type WHEN 'BASE TABLE' THEN 'table' WHEN 'VIEW' THEN 'view' WHEN 'FOREIGN' THEN 'foreign table' ELSE LOWER(table_type) END FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name`
+		}
+		rows, err := db.QueryContext(ctx, query, schema)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, value)
-	}
-	return out, rows.Err()
+		defer rows.Close()
+		var out []Table
+		for rows.Next() {
+			var value Table
+			if err := rows.Scan(&value.Name, &value.Type); err != nil {
+				return nil, err
+			}
+			out = append(out, value)
+		}
+		return out, rows.Err()
+	})
 }
 
 func (s *Store) Columns(ctx context.Context, id, schema, table string) ([]Column, error) {
@@ -426,9 +529,10 @@ func (s *Store) Columns(ctx context.Context, id, schema, table string) ([]Column
 	if err != nil {
 		return nil, err
 	}
-	query := `SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`
-	if c.Engine == EnginePostgres {
-		query = `SELECT c.column_name, c.data_type, c.udt_name, c.is_nullable,
+	return retrySafeRead(ctx, c, func(db *sql.DB) ([]Column, error) {
+		query := `SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`
+		if c.Engine == EnginePostgres {
+			query = `SELECT c.column_name, c.data_type, c.udt_name, c.is_nullable,
 			CASE WHEN EXISTS (
 				SELECT 1 FROM information_schema.table_constraints tc
 				JOIN information_schema.key_column_usage kcu
@@ -444,27 +548,28 @@ func (s *Store) Columns(ctx context.Context, id, schema, table string) ([]Column
 		FROM information_schema.columns c
 		WHERE c.table_schema = $1 AND c.table_name = $2
 		ORDER BY c.ordinal_position`
-	}
-	rows, err := c.db.QueryContext(ctx, query, schema, table)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Column
-	for rows.Next() {
-		var value Column
-		var nullable string
-		var def sql.NullString
-		if err := rows.Scan(&value.Name, &value.DataType, &value.ColumnType, &nullable, &value.Key, &def, &value.Extra); err != nil {
+		}
+		rows, err := db.QueryContext(ctx, query, schema, table)
+		if err != nil {
 			return nil, err
 		}
-		value.Nullable = nullable == "YES"
-		if def.Valid {
-			value.Default = &def.String
+		defer rows.Close()
+		var out []Column
+		for rows.Next() {
+			var value Column
+			var nullable string
+			var def sql.NullString
+			if err := rows.Scan(&value.Name, &value.DataType, &value.ColumnType, &nullable, &value.Key, &def, &value.Extra); err != nil {
+				return nil, err
+			}
+			value.Nullable = nullable == "YES"
+			if def.Valid {
+				value.Default = &def.String
+			}
+			out = append(out, value)
 		}
-		out = append(out, value)
-	}
-	return out, rows.Err()
+		return out, rows.Err()
+	})
 }
 
 func (s *Store) Browse(ctx context.Context, connectionID string, req BrowseRequest) (BrowseResult, error) {
@@ -482,20 +587,26 @@ func (s *Store) Browse(ctx context.Context, connectionID string, req BrowseReque
 		return BrowseResult{}, ctx.Err()
 	}
 
-	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	return retrySafeRead(ctx, c, func(db *sql.DB) (BrowseResult, error) {
+		return browseOnce(ctx, db, c.Engine, req)
+	})
+}
+
+func browseOnce(ctx context.Context, db *sql.DB, engine string, req BrowseRequest) (BrowseResult, error) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return BrowseResult{}, fmt.Errorf("start read-only browse transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	columns, err := browseColumns(ctx, tx, c.Engine, req.Schema, req.Table)
+	columns, err := browseColumns(ctx, tx, engine, req.Schema, req.Table)
 	if err != nil {
 		return BrowseResult{}, err
 	}
 	if len(columns) == 0 {
 		return BrowseResult{}, fmt.Errorf("%w: %s.%s", ErrBrowseNotFound, req.Schema, req.Table)
 	}
-	query, args, err := buildBrowseQueryForEngine(c.Engine, req, columns)
+	query, args, err := buildBrowseQueryForEngine(engine, req, columns)
 	if err != nil {
 		return BrowseResult{}, err
 	}
@@ -717,7 +828,7 @@ func (s *Store) StreamQuery(parent context.Context, connectionID string, req Que
 	queryID := s.nextID()
 	ctx, cancel := context.WithCancel(parent)
 	s.mu.Lock()
-	s.queries[queryID] = cancel
+	s.queries[queryID] = activeQuery{connectionID: connectionID, cancel: cancel}
 	s.mu.Unlock()
 	defer func() {
 		cancel()
@@ -863,12 +974,12 @@ func isText(b []byte) bool {
 
 func (s *Store) Cancel(id string) bool {
 	s.mu.RLock()
-	cancel := s.queries[id]
+	query, ok := s.queries[id]
 	s.mu.RUnlock()
-	if cancel == nil {
+	if !ok {
 		return false
 	}
-	cancel()
+	query.cancel()
 	return true
 }
 

@@ -26,6 +26,8 @@ The release binary is currently about 11 MB and the backend measured approximate
 - MySQL- and PostgreSQL-aware CodeMirror editor
 - Streaming, bounded query results with a virtualized grid
 - Query cancellation
+- Connection health checks, stale-session detection, and explicit reconnect
+- One automatic retry for safe metadata and table-browse reads after a transport failure
 - Optional, capped local query history
 - Copy loaded rows as TSV or export them as CSV
 - Exact string transport for large integers and decimals
@@ -114,6 +116,18 @@ Run the backend on port 7070:
 make dev-backend
 ```
 
+Create unsigned macOS archives for Apple Silicon and Intel, plus SHA-256 checksums:
+
+```sh
+make release-darwin VERSION=0.1.0-alpha
+```
+
+Measure backend startup, idle RSS, and large-result encoding on the current machine:
+
+```sh
+make benchmark
+```
+
 For Vite hot reload, run this in another terminal:
 
 ```sh
@@ -123,6 +137,19 @@ npm run dev
 ```
 
 The Vite development server proxies `/api` to `http://127.0.0.1:7070`.
+
+### Browser smoke test
+
+Rowlight includes a dependency-free WebDriver smoke test for Safari or Chromium. Start a WebDriver server, launch Rowlight with a fixed port, and pass the authenticated URL printed by Rowlight:
+
+```sh
+# Safari: enable Develop → Allow Remote Automation, then run:
+safaridriver -p 4444
+./bin/rowlight -no-open -port 7070
+ROWLIGHT_URL='http://127.0.0.1:7070/#token=…' BROWSER_NAME=safari make browser-smoke
+```
+
+For Chromium, point `WEBDRIVER_URL` at a running ChromeDriver and set `BROWSER_NAME=chrome`. The check verifies UI bootstrap, removal of the token from the URL, authenticated API access after refresh, and clean session shutdown.
 
 ### Integration tests
 
@@ -137,6 +164,8 @@ ROWLIGHT_TEST_PASSWORD=secret \
 ROWLIGHT_TEST_DATABASE=app \
 go test -run TestMariaDBIntegration -v ./internal/store
 ```
+
+For a certificate-enabled fixture, set `ROWLIGHT_TEST_TLS=custom` and `ROWLIGHT_TEST_CA_FILE` to its PEM CA certificate. `ROWLIGHT_TEST_SERVER_NAME` can override hostname verification when the certificate uses a different DNS name.
 
 PostgreSQL:
 
@@ -176,8 +205,9 @@ Frontend assets are compiled by Vite and embedded into the Go executable. The br
 - Table browsing uses offset pages of 100 rows by default and caps pages at 200 rows.
 - Unsorted offset pages have database-defined ordering.
 - At most two user queries execute concurrently across the process.
+- User SQL is never replayed after a connection failure. Reconnect explicitly, review the preserved SQL, and run it again.
 - CTEs, writable sessions, grid editing, SSH tunnel management, and Keychain storage are not implemented yet.
-- Signing, notarization, release archives, and a broader browser/database test matrix are still pending.
+- macOS archives are unsigned and not notarized. Safari/Chromium automation and a broader database/TLS matrix are still pending.
 
 See [PLAN.md](./PLAN.md) for the roadmap and validation goals. API and frontend development notes are in [web/README.md](./web/README.md).
 

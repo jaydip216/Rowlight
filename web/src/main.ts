@@ -1,5 +1,5 @@
 import "./styles.css";
-import { api } from "./api";
+import { api, ApiError } from "./api";
 import { createEditor, selectedQuery, setEditorEngine, setQuery } from "./editor";
 import { ResultGrid } from "./grid";
 import type { BrowseFilterOperator, BrowseRequest, ColumnItem, Connection, ConnectionInput, ConnectionProfile, DatabaseEngine, QueryEvent, QueryHistoryEntry, TableItem, TLSMode } from "./types";
@@ -9,6 +9,7 @@ app.innerHTML = `
   <header class="app-header">
     <div class="brand"><span class="brand-mark">RL</span><span>Rowlight</span></div>
     <div class="connection-state"><span class="status-dot"></span><span id="connection-label">Not connected</span></div>
+    <button id="reconnect" class="button warning hidden">Reconnect</button>
     <button id="disconnect" class="button ghost hidden">Disconnect</button>
   </header>
   <main>
@@ -123,6 +124,7 @@ const sortColumn = $("#sort-column") as HTMLSelectElement;
 const sortDirection = $("#sort-direction") as HTMLSelectElement;
 const previousPageButton = $("#previous-page") as HTMLButtonElement;
 const nextPageButton = $("#next-page") as HTMLButtonElement;
+const reconnectButton = $("#reconnect") as HTMLButtonElement;
 const grid = new ResultGrid($("#results"));
 
 let connection: Connection | null = null;
@@ -138,6 +140,8 @@ const activeConnectionKey = "rowlight-active-connection";
 type BrowseState = { schema: string; table: string; offset: number; pageSize: number; hasMore: boolean };
 let browseState: BrowseState | null = null;
 let browseLoading = false;
+let reconnectPromise: Promise<Connection> | null = null;
+let queryNeedsManualRerun = false;
 
 const editor = createEditor($("#editor"), () => void runQuery(), () => [...schemaNames]);
 
@@ -247,6 +251,107 @@ function showError(element: HTMLElement, error: unknown): void {
   element.classList.remove("hidden");
 }
 
+function engineName(engine = connection?.engine ?? selectedEngine()): string {
+  return engine === "postgres" ? "PostgreSQL" : "MySQL / MariaDB";
+}
+
+function connectionAttemptError(error: unknown, input: ConnectionInput): Error {
+  const detail = error instanceof Error ? error.message : "Unexpected error";
+  const target = `${input.host}:${input.port}`;
+  if (error instanceof TypeError) return new Error(`Rowlight's local server could not be reached. Check that Rowlight is still running, then try again. (${detail})`);
+  if (/certificate|\btls\b|x509/i.test(detail)) return new Error(`${engineName(input.engine)} TLS connection to ${target} failed: ${detail}`);
+  if (/password|authentication|access denied|28P01/i.test(detail)) return new Error(`${engineName(input.engine)} rejected the credentials for ${input.user || "this user"}: ${detail}`);
+  return new Error(`${engineName(input.engine)} connection to ${target} failed: ${detail}`);
+}
+
+function isRecoverableConnectionError(error: unknown): boolean {
+  return error instanceof ApiError && [502, 503, 504].includes(error.status);
+}
+
+function isLostSession(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 404;
+}
+
+function setConnectionHealthy(value: Connection): void {
+  connection = value;
+  sessionStorage.setItem(activeConnectionKey, JSON.stringify(value));
+  $("#connection-label").textContent = `${value.serverVersion} · read only`;
+  $(".status-dot").classList.add("online");
+  $(".status-dot").classList.remove("stale");
+  reconnectButton.classList.add("hidden");
+}
+
+function setConnectionStale(message = "Connection interrupted"): void {
+  $("#connection-label").textContent = message;
+  $(".status-dot").classList.remove("online");
+  $(".status-dot").classList.add("stale");
+  reconnectButton.classList.remove("hidden");
+}
+
+function returnToConnectionForm(message: string): void {
+  connection = null;
+  sessionStorage.removeItem(activeConnectionKey);
+  tableCache.clear(); columnCache.clear(); schemaNames.clear();
+  browseState = null; tableControls.classList.add("hidden");
+  workspace.classList.add("hidden"); connectView.classList.remove("hidden");
+  $("#disconnect").classList.add("hidden"); reconnectButton.classList.add("hidden");
+  $("#connection-label").textContent = "Not connected";
+  $(".status-dot").classList.remove("online", "stale");
+  showError(connectionError, new Error(message));
+}
+
+async function reconnect(): Promise<Connection> {
+  if (!connection) throw new Error("There is no connection to restore.");
+  if (reconnectPromise) return reconnectPromise;
+  const id = connection.id;
+  setBusy(reconnectButton, true, "Reconnecting…");
+  $("#connection-label").textContent = `Reconnecting to ${engineName()}…`;
+  reconnectPromise = api.reconnect(id);
+  try {
+    const restored = await reconnectPromise;
+    restored.engine ??= connection?.engine ?? "mysql";
+    setConnectionHealthy(restored);
+    return restored;
+  } catch (error) {
+    if (isLostSession(error)) returnToConnectionForm("This connection session expired. Enter the password and connect again.");
+    else if (error instanceof TypeError) setConnectionStale("Rowlight server unavailable");
+    else setConnectionStale(`${engineName()} unavailable`);
+    throw error;
+  } finally {
+    reconnectPromise = null;
+    setBusy(reconnectButton, false, "");
+  }
+}
+
+async function checkConnectionHealth(): Promise<void> {
+  if (!connection || queryController || document.visibilityState !== "visible") return;
+  try {
+    await api.connectionHealth(connection.id);
+    setConnectionHealthy(connection);
+  } catch (error) {
+    if (isLostSession(error)) {
+      returnToConnectionForm("This connection session expired. Enter the password and connect again.");
+    } else if (error instanceof TypeError) {
+      setConnectionStale("Rowlight server unavailable");
+    } else if (isRecoverableConnectionError(error)) {
+      setConnectionStale(`${engineName()} unavailable`);
+    }
+  }
+}
+
+async function withMetadataRecovery<T>(operation: () => Promise<T>): Promise<T> {
+	try {
+		return await operation();
+	} catch (error) {
+		if (isLostSession(error)) {
+			returnToConnectionForm("This connection session expired. Enter the password and connect again.");
+		} else if (isRecoverableConnectionError(error)) {
+			setConnectionStale(`${engineName()} unavailable`);
+		}
+		throw error;
+	}
+}
+
 async function connect(): Promise<void> {
   const button = $("#connect") as HTMLButtonElement;
   connectionError.classList.add("hidden");
@@ -255,19 +360,17 @@ async function connect(): Promise<void> {
     const input = connectionInput();
     connection = await api.connect(input);
     connection.engine ??= input.engine;
-    sessionStorage.setItem(activeConnectionKey, JSON.stringify(connection));
+    setConnectionHealthy(connection);
     try { await saveSelectedProfile(input); }
     catch (error) { showError(connectionError, error); }
     activeDatabase = connection.engine === "postgres" ? "" : connection.database;
-    $("#connection-label").textContent = `${connection.serverVersion} · read only`;
-    $(".status-dot").classList.add("online");
     $("#disconnect").classList.remove("hidden");
     connectView.classList.add("hidden");
     workspace.classList.remove("hidden");
     updateActiveDatabase();
     await loadDatabases();
     await loadHistory();
-  } catch (error) { showError(connectionError, error); }
+  } catch (error) { showError(connectionError, connectionAttemptError(error, connectionInput())); }
   finally { setBusy(button, false, ""); }
 }
 
@@ -280,19 +383,19 @@ async function restoreConnection(): Promise<boolean> {
     connection.engine ??= remembered.engine ?? "mysql";
     setFormValue("engine", connection.engine);
     updateEngineUI();
-    sessionStorage.setItem(activeConnectionKey, JSON.stringify(connection));
+    setConnectionHealthy(connection);
     activeDatabase = connection.engine === "postgres" ? "" : connection.database;
-    $("#connection-label").textContent = `${connection.serverVersion} · read only`;
-    $(".status-dot").classList.add("online");
     $("#disconnect").classList.remove("hidden");
     connectView.classList.add("hidden");
     workspace.classList.remove("hidden");
     updateActiveDatabase();
     await Promise.all([loadDatabases(), loadHistory()]);
     return true;
-  } catch {
+  } catch (error) {
     sessionStorage.removeItem(activeConnectionKey);
     connection = null;
+    if (isLostSession(error)) showError(connectionError, new Error("The saved connection session expired. Enter the password and connect again."));
+    else if (error instanceof TypeError) showError(connectionError, new Error("Rowlight's local server could not be reached. Check that Rowlight is still running."));
     return false;
   }
 }
@@ -301,7 +404,7 @@ async function loadDatabases(): Promise<void> {
   if (!connection) return;
   tree.innerHTML = `<div class="tree-loading">Loading schema…</div>`;
   try {
-    const { items } = await api.databases(connection.id);
+    const { items } = await withMetadataRecovery(() => api.databases(connection!.id));
     schemaNames.clear();
     items.forEach(({ name }) => schemaNames.add(name));
     tree.replaceChildren(...items.map(({ name }) => databaseNode(name)));
@@ -332,7 +435,7 @@ async function loadTables(container: HTMLDetailsElement, database: string): Prom
   const loading = document.createElement("div"); loading.className = "tree-loading"; loading.textContent = "Loading…";
   container.append(loading);
   try {
-    const { items } = await api.tables(connection.id, database);
+    const { items } = await withMetadataRecovery(() => api.tables(connection!.id, database));
     tableCache.set(database, items);
     items.forEach(({ name }) => schemaNames.add(`${database}.${name}`));
     loading.remove();
@@ -378,7 +481,7 @@ async function loadColumns(container: HTMLDetailsElement, database: string, tabl
   const loading = document.createElement("div"); loading.className = "tree-loading"; loading.textContent = "Loading…";
   container.append(loading);
   try {
-    const { items } = await api.columns(connection.id, database, table);
+    const { items } = await withMetadataRecovery(() => api.columns(connection!.id, database, table));
     columnCache.set(`${database}.${table}`, items);
     items.forEach(({ name }) => schemaNames.add(name));
     loading.remove();
@@ -434,7 +537,7 @@ async function loadBrowsePage(): Promise<void> {
     if (operator !== "isNull" && operator !== "isNotNull") request.filters[0]!.value = filterValue.value;
   }
   try {
-    const result = await api.browse(connection.id, request);
+    const result = await withMetadataRecovery(() => api.browse(connection!.id, request));
     if (!browseState) return;
     browseState.offset = result.offset;
     browseState.pageSize = result.pageSize;
@@ -470,6 +573,7 @@ async function runQuery(): Promise<void> {
   const sql = selectedQuery(editor);
   if (!sql) { showError(queryError, new Error("Enter a query to run.")); return; }
   browseState = null; tableControls.classList.add("hidden");
+  queryNeedsManualRerun = false;
   queryError.classList.add("hidden"); grid.reset(); updateResultActions();
   queryController = new AbortController(); queryId = undefined;
   runButton.classList.add("hidden"); cancelButton.classList.remove("hidden"); status.textContent = "Running…";
@@ -480,14 +584,35 @@ async function runQuery(): Promise<void> {
     if (event.type === "rows") { grid.append(event.rows); updateResultActions(); }
     if (event.type === "complete") status.textContent = `${event.rowCount.toLocaleString()} rows · ${event.elapsedMs} ms${event.truncated ? " · LIMIT REACHED" : ""}`;
     if (event.type === "cancelled") status.textContent = `Cancelled · ${event.rowCount.toLocaleString()} rows · ${event.elapsedMs} ms`;
-    if (event.type === "error") { showError(queryError, new Error(event.error)); status.textContent = "Query failed"; }
+    if (event.type === "error") {
+      if (event.code === "connection_unavailable" || event.retryable) {
+        queryNeedsManualRerun = true;
+        setConnectionStale(`${engineName()} connection interrupted`);
+        showError(queryError, new Error(`${event.error} Reconnect, then run the query again.`));
+      } else showError(queryError, new Error(event.error));
+      status.textContent = "Query failed";
+    }
   };
   try {
     const headerQueryId = await api.query(connection.id, sql, ($("#record-history") as HTMLInputElement).checked, queryController.signal, onEvent);
     queryId ??= headerQueryId;
     if (status.textContent === "Running…") status.textContent = `${grid.rowCount.toLocaleString()} rows · ${Math.round(performance.now() - started)} ms`;
   } catch (error) {
-    if ((error as DOMException).name !== "AbortError") { showError(queryError, error); status.textContent = "Query failed"; }
+    if ((error as DOMException).name !== "AbortError") {
+      if (isLostSession(error)) {
+        returnToConnectionForm("This connection session expired. Your query was not rerun. Enter the password and connect again.");
+      } else {
+        if (isRecoverableConnectionError(error)) {
+          queryNeedsManualRerun = true;
+          setConnectionStale(`${engineName()} connection interrupted`);
+          showError(queryError, new Error(`${error instanceof Error ? error.message : "Query failed"} Reconnect, then run the query again.`));
+        } else if (error instanceof TypeError) {
+          setConnectionStale("Rowlight server unavailable");
+          showError(queryError, new Error("Rowlight's local server became unavailable. The query was not rerun."));
+        } else showError(queryError, error);
+        status.textContent = "Query failed";
+      }
+    }
   } finally {
     queryController = undefined; queryId = undefined;
     runButton.classList.remove("hidden"); cancelButton.classList.add("hidden");
@@ -546,7 +671,7 @@ $("#test-connection").addEventListener("click", async () => {
   const button = $("#test-connection") as HTMLButtonElement; connectionError.classList.add("hidden"); testResult.textContent = "";
   setBusy(button, true, "Testing…");
   try { const value = await api.testConnection(connectionInput()); testResult.textContent = `Connected · ${value.serverVersion}`; }
-  catch (error) { showError(connectionError, error); }
+  catch (error) { showError(connectionError, connectionAttemptError(error, connectionInput())); }
   finally { setBusy(button, false, ""); }
 });
 $("select[name=tlsMode]").addEventListener("change", (event) => {
@@ -561,7 +686,25 @@ $("#disconnect").addEventListener("click", async () => {
   browseState = null; tableControls.classList.add("hidden");
   sessionStorage.removeItem(activeConnectionKey);
   workspace.classList.add("hidden"); connectView.classList.remove("hidden"); $("#disconnect").classList.add("hidden");
-  $("#connection-label").textContent = "Not connected"; $(".status-dot").classList.remove("online");
+  $("#connection-label").textContent = "Not connected"; $(".status-dot").classList.remove("online", "stale"); reconnectButton.classList.add("hidden");
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void checkConnectionHealth();
+});
+window.addEventListener("online", () => void checkConnectionHealth());
+
+reconnectButton.addEventListener("click", async () => {
+  queryError.classList.add("hidden");
+  try {
+    await reconnect();
+    status.textContent = queryNeedsManualRerun ? "Reconnected · query was not rerun" : "Reconnected";
+    queryNeedsManualRerun = false;
+    await loadDatabases();
+  } catch (error) {
+    if (connection) showError(queryError, error instanceof TypeError
+      ? new Error("Rowlight's local server is unavailable. Keep this tab open and try Reconnect again after restarting Rowlight.")
+      : error);
+  }
 });
 $("#refresh-schema").addEventListener("click", () => { tableCache.clear(); columnCache.clear(); void loadDatabases(); });
 $("#schema-filter").addEventListener("input", (event) => {

@@ -25,6 +25,7 @@ button { color: inherit; }
 .connection-state { margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #536170; }
 .status-dot.online { background: var(--accent); box-shadow: 0 0 9px #63e6be66; }
+.status-dot.stale { background: #f6ad55; box-shadow: 0 0 9px #f6ad5566; }
 main { height: calc(100% - 52px); }
 .connect-view { height: 100%; display: grid; place-items: center; overflow: auto; padding: 32px; background: radial-gradient(circle at 50% 0%, #16231f 0, #0b0f14 38%); }
 .connection-card { width: min(620px, 100%); padding: 28px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: 0 24px 80px #0008; }
@@ -49,6 +50,8 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, monospac
 .button.primary { color: #06261d; background: var(--accent); }
 .button.primary:hover { background: #86edcd; }
 .button.secondary, .button.ghost { border-color: var(--border); background: var(--surface-2); }
+.button.warning { color: #ffd49a; border-color: #755126; background: #2d2113; }
+.button.warning:hover { background: #3a2a17; }
 .button.danger { color: #ffb4b8; border-color: #753f45; background: #321b20; }
 .alert { margin-top: 16px; padding: 10px 12px; border-radius: 6px; font-size: 12px; }
 .error { color: #ffc4c7; border: 1px solid #66353b; background: #2a171b; }
