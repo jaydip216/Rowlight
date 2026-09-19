@@ -28,10 +28,15 @@ for command in curl tar shasum; do
 done
 
 if [ -z "$tag" ]; then
-  tag=$(curl -fsSL \
+  release_metadata=$(curl -fsSL \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
-    "https://api.github.com/repos/$repository/releases/latest" \
+    "https://api.github.com/repos/$repository/releases/latest" 2>/dev/null \
+    || curl -fsSL \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "https://api.github.com/repos/$repository/releases?per_page=1")
+  tag=$(printf '%s\n' "$release_metadata" \
     | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
     | head -n 1)
   if [ -z "$tag" ]; then
