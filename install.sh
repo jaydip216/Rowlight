@@ -70,14 +70,23 @@ fi
 
 tar -xzf "$temporary_dir/$archive" -C "$temporary_dir" rowlight
 
+# A custom destination such as ~/.local/bin may not exist yet but can usually
+# be created without elevated privileges.
+if [ ! -d "$install_dir" ]; then
+  mkdir -p "$install_dir" 2>/dev/null || true
+fi
+
 if [ -d "$install_dir" ] && [ -w "$install_dir" ]; then
   install -m 0755 "$temporary_dir/rowlight" "$install_dir/rowlight"
 elif [ "$(id -u)" -eq 0 ]; then
   mkdir -p "$install_dir"
   install -m 0755 "$temporary_dir/rowlight" "$install_dir/rowlight"
 elif command -v sudo >/dev/null 2>&1; then
-  sudo mkdir -p "$install_dir"
-  sudo install -m 0755 "$temporary_dir/rowlight" "$install_dir/rowlight"
+  if ! sudo mkdir -p "$install_dir" || ! sudo install -m 0755 "$temporary_dir/rowlight" "$install_dir/rowlight"; then
+    echo "Could not install to $install_dir with sudo." >&2
+    echo "Try again with ROWLIGHT_INSTALL_DIR=\"\$HOME/.local/bin\"." >&2
+    exit 1
+  fi
 else
   echo "Cannot write to $install_dir and sudo is unavailable." >&2
   echo "Set ROWLIGHT_INSTALL_DIR to a writable directory and try again." >&2
