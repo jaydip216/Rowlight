@@ -39,7 +39,8 @@ The release binary is currently about 11 MB and the backend measured approximate
 Install the latest macOS release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jaydip216/Rowlight/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jaydip216/Rowlight/master/install.sh -o /tmp/rowlight-install.sh
+sh /tmp/rowlight-install.sh
 ```
 
 The installer detects Apple Silicon or Intel, verifies the release SHA-256 checksum, and installs `rowlight` into `/usr/local/bin`. It asks for `sudo` only when that directory is not writable.
@@ -53,7 +54,7 @@ rowlight
 To install a specific release or choose another destination:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jaydip216/Rowlight/master/install.sh | ROWLIGHT_VERSION=v0.1.0-alpha ROWLIGHT_INSTALL_DIR="$HOME/.local/bin" sh
+ROWLIGHT_VERSION=v0.1.0-alpha ROWLIGHT_INSTALL_DIR="$HOME/.local/bin" sh /tmp/rowlight-install.sh
 ```
 
 ### Build from source
